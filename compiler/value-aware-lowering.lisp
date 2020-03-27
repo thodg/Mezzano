@@ -1,12 +1,15 @@
 ;;;; Copyright (c) 2015-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 ;;; Lower forms based on the number of values they're expected to generated.
 ;;; Either no value (for effect, not 0 values), one value or mulitple (including 0) values.
 
-(defun value-aware-lowering (lambda)
+(defvar *rename-list*)
+
+(defun value-aware-lowering (lambda architecture)
+  (declare (ignore architecture))
   (let ((*rename-list* '()))
     (value-aware-lowering-1 lambda :single)))
 
@@ -20,6 +23,7 @@
      (change-made)
      (let* ((info (info form))
             (end-tag (make-instance 'go-tag
+                                    :inherit info
                                     :name 'block-end
                                     :use-count 5
                                     :tagbody info)))
@@ -29,7 +33,8 @@
                        :go-tags (list end-tag))
          (ast `(tagbody ,info
                   (entry ,body)
-                  (,end-tag 'nil))))))
+                  (,end-tag 'nil))
+              form))))
     ((:single :multiple)
      (setf (body form) (value-aware-lowering-1 (body form) mode))
      form)))
@@ -38,7 +43,7 @@
   (ecase mode
     (:effect
      (change-made)
-     (ast `(quote nil)))
+     (ast `(quote nil) form))
     ((:single :multiple)
      form)))
 
@@ -68,7 +73,33 @@
   (declare (ignore mode))
   (setf (function-form form) (value-aware-lowering-1 (function-form form) :single)
         (value-form form) (value-aware-lowering-1 (value-form form) :multiple))
-  form)
+  (cond ((and (typep (value-form form) 'ast-call)
+              (eql (ast-name (value-form form)) 'values))
+         ;; Replace this with funcall.
+         (change-made)
+         (ast `(call mezzano.runtime::%funcall
+                     ,(function-form form)
+                     ,@(ast-arguments (value-form form)))
+              form))
+        ((and (typep (value-form form) 'ast-call)
+              (eql (ast-name (value-form form)) 'values-list)
+              (eql (length (ast-arguments (value-form form))) 1))
+         ;; Replace this with apply.
+         (change-made)
+         (ast `(call mezzano.runtime::%apply
+                     ,(function-form form)
+                     ,(first (ast-arguments (value-form form))))
+              form))
+        ((or (typep (value-form form) 'ast-quote)
+             (typep (value-form form) 'lexical-variable))
+         ;; Replace this with funcall.
+         (change-made)
+         (ast `(call mezzano.runtime::%funcall
+                     ,(function-form form)
+                     ,(value-form form))
+              form))
+        (t
+         form)))
 
 (defmethod value-aware-lowering-1 ((form ast-multiple-value-prog1) mode)
   (ecase mode
@@ -77,7 +108,8 @@
      (change-made)
      (value-aware-lowering-1
       (ast `(progn ,(value-form form)
-                   ,(body form)))
+                   ,(body form))
+           form)
       :effect))
     (:single
      ;; Replace with PROG1.
@@ -86,7 +118,8 @@
       (ast `(let ((result-value ,(value-form form)))
               (progn
                 ,(body form)
-                result-value)))
+                result-value))
+           form)
       :single))
     (:multiple
      (setf (value-form form) (value-aware-lowering-1 (value-form form) :multiple)
@@ -114,7 +147,8 @@
       (ast `(progn
               ,(value form)
               (go ,(cdr (assoc (target form) *rename-list*))
-                  ,(info form))))
+                  ,(info form)))
+           form)
       :effect))
     ((:single :multiple)
      (setf (value form) (value-aware-lowering-1 (value form)
@@ -133,13 +167,20 @@
   form)
 
 (defmethod value-aware-lowering-1 ((form ast-the) mode)
-  (setf (value form) (value-aware-lowering-1 (value form) mode))
-  form)
+  (ecase mode
+    (:effect
+     (change-made)
+     (value-aware-lowering-1 (value form) mode))
+    ((:single :multiple)
+     (setf (value form) (value-aware-lowering-1 (value form) mode))
+     form)))
 
 (defmethod value-aware-lowering-1 ((form ast-unwind-protect) mode)
   (setf (protected-form form) (value-aware-lowering-1 (protected-form form) mode)
         (cleanup-function form) (value-aware-lowering-1 (cleanup-function form) :single))
   form)
+
+(defparameter *pure-functions* '(consp sys.int::fixnump cons list list* copy-list))
 
 (defmethod value-aware-lowering-1 ((form ast-call) mode)
   (cond ((and (eql (name form) 'values)
@@ -148,7 +189,7 @@
          (change-made)
          (cond ((endp (arguments form))
                 ;; No arguments, evaluate to NIL.
-                (ast `(quote nil)))
+                (ast `(quote nil) form))
                ((endp (rest (arguments form)))
                 ;; One argument, evaluate to it.
                 (value-aware-lowering-1 (first (arguments form)) mode))
@@ -157,8 +198,15 @@
                  (ast `(let ((result-value ,(first (arguments form))))
                          (progn
                            ,@(rest (arguments form))
-                           result-value)))
+                           result-value))
+                      form)
                  mode))))
+        ((and (eql mode :effect)
+              (member (name form) *pure-functions* :test #'equal))
+         ;; (call <pure-function> ...) => (progn ...)
+         (value-aware-lowering-1 (ast `(progn ,@(arguments form))
+                                      form)
+                                 mode))
         (t
          (setf (arguments form) (loop
                                    for arg in (arguments form)
@@ -177,7 +225,7 @@
   (ecase mode
     (:effect
      (change-made)
-     (ast `(quote nil)))
+     (ast `(quote nil) form))
     ((:single :multiple)
      form)))
 

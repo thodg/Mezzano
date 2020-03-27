@@ -1,9 +1,12 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-;;;; String functions. These replace most of the genesis string functions.
+;;;; String functions.
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
+
+(deftype string-designator ()
+  `(or string symbol character))
 
 (defun string (x)
   (etypecase x
@@ -12,12 +15,14 @@
     (symbol (symbol-name x))))
 
 (defun stringp (object)
-  (and (character-array-p object)
+  (and (or (character-array-p object)
+           ;; Cover displaced arrays too.
+           (and (arrayp object)
+                (eql (array-element-type object) 'character)))
        (eql (array-rank object) 1)))
 
 (defun simple-string-p (object)
-  (and (simple-character-array-p object)
-       (eql (array-rank object) 1)))
+  (typep object 'simple-string))
 
 (macrolet ((def (name comparator docstring)
              `(defun ,name (string1 string2 &key (start1 0) end1 (start2 0) end2)
@@ -43,7 +48,6 @@ same characters in the corresponding positions; otherwise it returns false."))
 (macrolet ((def (name modifier copy &optional documentation)
              `(defun ,name (string &key (start 0) end)
                 ,@(when documentation (list documentation))
-                (declare (type string string))
                 ,(if copy
                      `(setf string (string string))
                      `(check-type string string))
@@ -61,6 +65,15 @@ same characters in the corresponding positions; otherwise it returns false."))
   (def nstring-upcase char-upcase nil)
   (def nstring-downcase char-downcase nil))
 
+(defun string-capitalize (name &key (start 0) end)
+  (setf name (string name))
+  (format nil "~A~:(~A~)~A"
+          (subseq name 0 start)
+          (subseq name start end)
+          (if end
+              (subseq name end)
+              "")))
+
 (macrolet ((def (sensitive-name insensitive-name char-comparator numeric-comparator)
              `(progn
                 (defun ,sensitive-name (string1 string2 &key (start1 0) end1 (start2 0) end2)
@@ -71,7 +84,8 @@ same characters in the corresponding positions; otherwise it returns false."))
                   (dotimes (i (min (- end1 start1)
                                    (- end2 start2))
                             (if (,numeric-comparator (- end1 start1) (- end2 start2))
-                                end1
+                                (+ start1 (min (- end1 start1)
+                                               (- end2 start2)))
                                 nil))
                     ;; Compare prefix.
                     (unless (char= (char string1 (+ start1 i))
@@ -118,3 +132,17 @@ same characters in the corresponding positions; otherwise it returns false."))
   (if initial-element
       (make-array size :element-type element-type :initial-element initial-element)
       (make-array size :element-type element-type)))
+
+(defun explode (character string &optional (start 0) end)
+    "Break a string apart into a list using CHARACTER as
+the seperator character."
+  (setf end (or end (length string)))
+  (do ((elements '())
+       (i start (1+ i))
+       (elt-start start))
+      ((>= i end)
+       (push (subseq string elt-start i) elements)
+       (nreverse elements))
+    (when (eql (char string i) character)
+      (push (subseq string elt-start i) elements)
+      (setf elt-start (1+ i)))))

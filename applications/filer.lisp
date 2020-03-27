@@ -7,9 +7,9 @@
 
 (in-package :mezzano.gui.filer)
 
-(defvar *up-icon* (mezzano.gui.desktop::load-image "LOCAL:>Icons>16x16 Up.png"))
-(defvar *file-icon* (mezzano.gui.desktop::load-image "LOCAL:>Icons>16x16 File.png"))
-(defvar *folder-icon* (mezzano.gui.desktop::load-image "LOCAL:>Icons>16x16 Folder.png"))
+(defvar *up-icon* (mezzano.gui.image:load-image "LOCAL:>Icons>16x16 Up.png"))
+(defvar *file-icon* (mezzano.gui.image:load-image "LOCAL:>Icons>16x16 File.png"))
+(defvar *folder-icon* (mezzano.gui.image:load-image "LOCAL:>Icons>16x16 Folder.png"))
 
 (defvar *directory-colour* mezzano.gui:*default-foreground-colour*)
 
@@ -20,6 +20,8 @@
     (:text (mezzano.gui:make-colour-from-octets #xCC #x93 #x93))
     (:font (mezzano.gui:make-colour-from-octets #x7F #x9F #x7F))
     (:image (mezzano.gui:make-colour-from-octets #xDC #x8C #xC3))
+    (:video (mezzano.gui:make-colour-from-octets #xDC #x8C #xC3))
+    (:audio (mezzano.gui:make-colour-from-octets #xDC #x8C #xC3))
     (t mezzano.gui:*default-foreground-colour*)))
 
 (defclass filer ()
@@ -41,9 +43,11 @@
 (defvar *type-registry*
   '((:lisp-source-code "lisp" "lsp" "asd" "lisp-expr")
     (:compiled-lisp-code "llf")
-    (:text "text" "txt" "html" "css" "texinfo" "tex" "sh" "markdown" "md" "el")
+    (:text "text" "txt" "html" "css" "texinfo" "tex" "sh" "markdown" "md" "el" "cfg")
     (:font "ttf")
-    (:image "png" "jpeg" "jpg")))
+    (:image "png" "jpeg" "jpg")
+    (:video "avi" "gif")
+    (:audio "wav")))
 
 (defun canonical-type-from-pathname-type (type-string)
   (when (or (not type-string)
@@ -61,13 +65,7 @@
     (error "No way to view files of type ~A." type)))
 
 (defun view-in-editor (path)
-  ;; Ech, the terrible groveling.
-  (let ((existing (mezzano.gui.compositor:get-window-by-kind :editor)))
-    (cond (existing
-           (mezzano.supervisor:fifo-push (make-instance (read-from-string "med:open-file-request") :path path)
-                                           (mezzano.gui.compositor::fifo existing)
-                                           nil))
-          (t (funcall (read-from-string "med:spawn") :initial-file path)))))
+  (ed path))
 
 (defmethod view ((type (eql :lisp-source-code)) path)
   (view-in-editor path))
@@ -77,6 +75,12 @@
 
 (defmethod view ((type (eql :image)) path)
   (funcall (read-from-string "mezzano.gui.image-viewer:spawn") path))
+
+(defmethod view ((type (eql :video)) path)
+  (funcall (read-from-string "mezzano.gui.trentino:spawn") path))
+
+(defmethod view ((type (eql :audio)) path)
+  (funcall (read-from-string "mezzano.gui.music-player:spawn") path))
 
 (defun click (viewer thing)
   (cond ((functionp thing)
@@ -99,11 +103,30 @@
              (return (click window thing)))))))
 
 (defmethod dispatch-event (window (event mezzano.gui.compositor:window-close-event))
-  (declare (ignore window event))
+  (throw 'mezzano.supervisor::terminate-thread nil))
+
+(defmethod dispatch-event (window (event mezzano.gui.compositor:quit-event))
   (throw 'mezzano.supervisor::terminate-thread nil))
 
 (defmethod dispatch-event (window (event mezzano.gui.compositor:key-event))
   (declare (ignore window event)))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-request-event))
+  (let ((old-width (mezzano.gui.compositor:width (window app)))
+        (old-height (mezzano.gui.compositor:height (window app)))
+        (new-width (max 100 (mezzano.gui.compositor:width event)))
+        (new-height (max 100 (mezzano.gui.compositor:height event))))
+    (when (or (not (eql old-width new-width))
+              (not (eql old-height new-height)))
+      (let ((new-framebuffer (mezzano.gui:make-surface
+                              new-width new-height)))
+        (mezzano.gui.widgets:resize-frame (frame app) new-framebuffer)
+        (mezzano.gui.compositor:resize-window
+         (window app) new-framebuffer
+         :origin (mezzano.gui.compositor:resize-origin event))))))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-event))
+  (change-path app (path app)))
 
 (defun draw-string (string font framebuffer x y colour)
   (loop
@@ -124,11 +147,7 @@
 
 (defun change-path (viewer new-path)
   (setf (path viewer) new-path
-        ;; Grumble
-        (mezzano.gui.widgets:frame-title (frame viewer)) (concatenate 'string
-                                                                      (string (mezzano.file-system:host-name (pathname-host new-path)))
-                                                                      ":"
-                                                                      (mezzano.file-system:unparse-pathname new-path (pathname-host new-path))))
+        (mezzano.gui.widgets:frame-title (frame viewer)) (namestring new-path))
   (let* ((window (window viewer))
          (framebuffer (mezzano.gui.compositor:window-buffer window))
          (font (font viewer))
@@ -136,6 +155,7 @@
          (height (mezzano.gui.compositor:height window))
          (stuff (directory (make-pathname :name :wild
                                           :type :wild
+                                          :device :wild
                                           :defaults new-path)))
          (files (sort (remove-if-not (lambda (x) (pathname-name x)) stuff)
                       #'string-lessp
@@ -191,9 +211,10 @@
                    (setf left-margin (+ next-left-margin 8)))))
           (setf (clickables viewer) '())
           (let ((pen left))
-            (dolist (host (remove :http (mezzano.file-system:list-all-hosts)
-                                  :key #'mezzano.file-system:host-name
-                                  :test #'string-equal))
+            (dolist (host (remove-if (lambda (host)
+                                       (or (string-equal (mezzano.file-system:host-name host) :http)
+                                           (typep host 'mezzano.file-system:logical-host)))
+                                     (mezzano.file-system:list-all-hosts)))
               (let ((before pen))
                 (incf pen 10)
                 (cond ((eql host (pathname-host new-path))
@@ -264,7 +285,9 @@
                                      :framebuffer framebuffer
                                      :title (namestring default-path)
                                      :close-button-p t
-                                     :damage-function (mezzano.gui.widgets:default-damage-function window)))
+                                     :resizablep t
+                                     :damage-function (mezzano.gui.widgets:default-damage-function window)
+                                     :set-cursor-function (mezzano.gui.widgets:default-cursor-function window)))
                (filer (make-instance 'filer
                                      :fifo fifo
                                      :window window

@@ -3,7 +3,7 @@
 
 ;;;; Lower anything that modifies the special stack to explicit compiler builtins.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 (defvar *special-bindings*)
 (defvar *verify-special-stack* nil)
@@ -35,6 +35,12 @@
     (assert (or (null (lambda-information-rest-arg lambda))
                 (lexical-variable-p (lambda-information-rest-arg lambda)))
             (lambda) "Special rest argument did not get lowered!")
+    (assert (or (null (lambda-information-closure-arg lambda))
+                (lexical-variable-p (lambda-information-closure-arg lambda)))
+            (lambda) "Special closure argument did not get lowered!")
+    (assert (or (null (lambda-information-count-arg lambda))
+                (lexical-variable-p (lambda-information-count-arg lambda)))
+            (lambda) "Special count argument did not get lowered!")
     (setf (lambda-information-body lambda)
           (lsb-form (lambda-information-body lambda)))
     (when (and *verify-special-stack*
@@ -46,7 +52,8 @@
                     (multiple-value-prog1 ,(lambda-information-body lambda)
                       (if (call eq ssp (call sys.int::%%special-stack-pointer))
                           'nil
-                          (call error '"SSP mismatch")))))))
+                          (call error '"SSP mismatch"))))
+                 lambda)))
     lambda))
 
 (defmethod lsb-form ((form ast-block))
@@ -67,10 +74,12 @@
                        ,(block-information-env-var info)
                        (quote ,(block-information-env-offset info)))
                  (multiple-value-prog1 ,(lsb-form (body form))
-                   (call sys.int::%%disestablish-block-or-tagbody))))))
+                   (call sys.int::%%disestablish-block-or-tagbody))))
+            form))
       (t ;; Local block.
        (ast `(block ,info
-               ,(lsb-form (body form))))))))
+               ,(lsb-form (body form)))
+            form)))))
 
 (defmethod lsb-form ((form ast-function))
   form)
@@ -81,7 +90,8 @@
     (cond ((eql (go-tag-tagbody tag) location)
            ;; Local GO, locate the matching TAGBODY and emit any unwind forms required.
            (ast `(progn ,@(lsb-unwind-to (lsb-find-b-or-t-binding location))
-                        (go ,tag ,location))))
+                        (go ,tag ,location))
+                form))
           (t ;; Non-local GO, do the full unwind.
            (ast `(let ((info ,(lsb-form location)))
                    (progn
@@ -91,15 +101,17 @@
                          (call sys.int::raise-bad-go-tag (quote (go-tag-name tag))))
                      (call sys.int::%%unwind-to
                            (call sys.int::%%tagbody-info-binding-stack-pointer info))
-                     (go ,tag info))))))))
+                     (go ,tag info)))
+                form)))))
 
 (defmethod lsb-form ((form ast-if))
   (ast `(if ,(lsb-form (test form))
             ,(lsb-form (if-then form))
-            ,(lsb-form (if-else form)))))
+            ,(lsb-form (if-else form)))
+       form))
 
 (defmethod lsb-form ((form ast-let))
-  (let ((*special-bindings* *special-bindings*))
+  (let ((updated-special-bindings *special-bindings*))
     (labels ((frob (bindings)
                (cond (bindings
                       (let* ((binding (first bindings))
@@ -108,34 +120,42 @@
                         (etypecase variable
                           (lexical-variable
                            (ast `(let ((,variable ,(lsb-form init-form)))
-                                   ,(frob (rest bindings)))))
+                                   ,(frob (rest bindings)))
+                                form))
                           (special-variable
                            (push (list :special (first binding))
-                                 *special-bindings*)
+                                 updated-special-bindings)
                            (ast `(progn
                                    (call sys.int::%%bind
-                                         (quote ,(name variable))
+                                         (quote ,(mezzano.runtime::symbol-global-value-cell (name variable)))
                                          ,(lsb-form init-form))
                                    (multiple-value-prog1 ,(frob (rest bindings))
-                                     (call sys.int::%%unbind))))))))
-                     (t (lsb-form (body form))))))
+                                     (call sys.int::%%unbind)))
+                                form)))))
+                     (t
+                      (let ((*special-bindings* updated-special-bindings))
+                        (lsb-form (body form)))))))
       (frob (bindings form)))))
 
 (defmethod lsb-form ((form ast-multiple-value-bind))
   (ast `(multiple-value-bind ,(bindings form)
             ,(lsb-form (value-form form))
-          ,(lsb-form (body form)))))
+          ,(lsb-form (body form)))
+       form))
 
 (defmethod lsb-form ((form ast-multiple-value-call))
   (ast `(multiple-value-call ,(lsb-form (function-form form))
-          ,(lsb-form (value-form form)))))
+          ,(lsb-form (value-form form)))
+       form))
 
 (defmethod lsb-form ((form ast-multiple-value-prog1))
   (ast `(multiple-value-prog1 ,(lsb-form (value-form form))
-          ,(lsb-form (body form)))))
+          ,(lsb-form (body form)))
+       form))
 
 (defmethod lsb-form ((form ast-progn))
-  (ast `(progn ,@(mapcar #'lsb-form (forms form)))))
+  (ast `(progn ,@(mapcar #'lsb-form (forms form)))
+       form))
 
 (defmethod lsb-form ((form ast-quote))
   form)
@@ -156,18 +176,27 @@
                            ,(lsb-form value-form)
                          (call sys.int::%%unwind-to
                                (call sys.int::%%block-info-binding-stack-pointer info)))
-                       info)))))
+                       info)))
+                form))
           (t
            ;; Local RETURN-FROM, locate the matching BLOCK and emit any unwind forms required.
            ;; Note: Unwinding one-past the location so as to pop the block as well.
-           (ast `(return-from ,tag
-                   (multiple-value-prog1
-                       ,(lsb-form value-form)
-                     (progn ,@(lsb-unwind-to (cdr (lsb-find-b-or-t-binding tag)))))
-                   ,location))))))
+           ;; Avoid generating M-V-P1 if there's nothing to unwind.
+           (let ((converted-value-form (lsb-form value-form))
+                 (unwind-forms (lsb-unwind-to (cdr (lsb-find-b-or-t-binding tag)))))
+             (if unwind-forms
+                 (ast `(return-from ,tag
+                         (multiple-value-prog1
+                             ,converted-value-form
+                           (progn ,@unwind-forms))
+                         ,location)
+                      form)
+                 (ast `(return-from ,tag ,converted-value-form ,location)
+                      form)))))))
 
 (defmethod lsb-form ((form ast-setq))
-  (ast `(setq ,(setq-variable form) ,(lsb-form (value form)))))
+  (ast `(setq ,(setq-variable form) ,(lsb-form (value form)))
+       form))
 
 (defmethod lsb-form ((form ast-tagbody))
   (let ((*special-bindings* *special-bindings*)
@@ -176,7 +205,8 @@
              (ast `(tagbody ,(info form)
                       ,@(loop
                            for (go-tag stmt) in (statements form)
-                           collect (list go-tag (lsb-form stmt)))))))
+                           collect (list go-tag (lsb-form stmt))))
+                  form)))
       (push (list :block-or-tagbody
                   info
                   (tagbody-information-env-var info)
@@ -192,12 +222,14 @@
                        (quote ,(tagbody-information-env-offset info)))
                  ,(frob-tagbody)
                  (call sys.int::%%disestablish-block-or-tagbody)
-                 'nil)))
+                 'nil)
+              form))
         (t ;; Local TAGBODY.
          (frob-tagbody))))))
 
 (defmethod lsb-form ((form ast-the))
-  (ast `(the ,(the-type form) ,(lsb-form (value form)))))
+  (ast `(the ,(the-type form) ,(lsb-form (value form)))
+       form))
 
 (defmethod lsb-form ((form ast-unwind-protect))
   (let ((*special-bindings* (cons (list :unwind-protect) *special-bindings*))
@@ -208,7 +240,8 @@
     (assert (or (lambda-information-p cleanup-function)
                 (and (typep cleanup-function 'ast-call)
                      (eql (name cleanup-function) 'sys.int::make-closure)
-                     (= (list-length (arguments cleanup-function)) 2)
+                     (or (= (list-length (arguments cleanup-function)) 2)
+                         (= (list-length (arguments cleanup-function)) 3))
                      (lambda-information-p (first (arguments cleanup-function))))))
     (when (not (lambda-information-p cleanup-function))
       ;; cleanup closures use the unwind-protect call protocol (code in r13, env in rbx, no closure indirection).
@@ -224,15 +257,18 @@
                                  (lsb-form (second (arguments cleanup-function)))))))
                  (multiple-value-prog1
                      ,(lsb-form protected-form)
-                   (call sys.int::%%disestablish-unwind-protect))))))
+                   (call sys.int::%%disestablish-unwind-protect)))
+         form)))
 
 (defmethod lsb-form ((form ast-call))
   (ast `(call ,(name form)
-              ,@(mapcar #'lsb-form (arguments form)))))
+              ,@(mapcar #'lsb-form (arguments form)))
+       form))
 
 (defmethod lsb-form ((form ast-jump-table))
   (ast `(jump-table ,(lsb-form (value form))
-                    ,@(mapcar #'lsb-form (targets form)))))
+                    ,@(mapcar #'lsb-form (targets form)))
+       form))
 
 (defmethod lsb-form ((form lexical-variable))
   form)

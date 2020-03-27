@@ -1,7 +1,7 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 ;;; Attempt to eliminate temporary variables (bound, never assigned, used once).
 ;;; Bound forms are pushed forward through the IR until their one use point
@@ -12,7 +12,9 @@
 ;;; VALUES prevents additional values from leaking without any impact on the
 ;;; generated code.
 
-(defun kill-temporaries (lambda)
+(defun kill-temporaries (lambda architecture)
+  (declare (ignore architecture))
+  (detect-uses lambda)
   (kt-form lambda))
 
 (defgeneric kt-form (form &optional target-variable replacement-form))
@@ -20,18 +22,38 @@
 (defmethod kt-form ((form lexical-variable) &optional target-variable replacement-form)
   (cond ((eql form target-variable)
          (change-made)
-         (values (ast `(call values ,replacement-form))
+         (values (ast `(call values ,replacement-form) form)
                  t))
         (t (values form nil))))
 
-(defun kt-implicit-progn (x &optional target-variable replacement-form)
-  (when x
-    ;; Only push through the first form.
-    (multiple-value-bind (first-form did-replace)
-        (kt-form (first x) target-variable replacement-form)
-      (values (list* first-form
-                     (mapcar #'kt-form (rest x)))
-              did-replace))))
+(defun kt-implicit-progn (forms &optional target-variable replacement-form)
+  (let ((did-something nil))
+    (values
+     (loop
+        with saw-impure = nil
+        for form in forms
+        collect (cond
+                  ((or saw-impure
+                       did-something
+                       (typep (unwrap-the form) '(or ast-quote ast-function lambda-information)))
+                   (kt-form form))
+                  ((and (typep (unwrap-the form) 'lexical-variable)
+                        ;; Don't skip over variables if they are written to.
+                        ;; The replacement form may contain a SETQ.
+                        (zerop (lexical-variable-write-count (unwrap-the form))))
+                   (multiple-value-bind (new did-replace)
+                       (kt-form form target-variable replacement-form)
+                     (when did-replace
+                       (setf did-something t))
+                     new))
+                  (t
+                   (setf saw-impure t)
+                   (multiple-value-bind (new did-replace)
+                       (kt-form form target-variable replacement-form)
+                     (when did-replace
+                       (setf did-something t))
+                     new))))
+     did-something)))
 
 (defmethod kt-form ((form lambda-information) &optional target-variable replacement-form)
   (declare (ignore target-variable replacement-form))
@@ -49,13 +71,16 @@
       (kt-implicit-progn (arguments form)
                          target-variable
                          replacement-form)
-    (values (ast `(call ,(name form) ,@new-list))
+    (values (ast `(call ,(name form) ,@new-list) form)
             did-replace)))
 
 (defun temporary-p (varlike)
   (and (lexical-variable-p varlike)
        (eql (lexical-variable-use-count varlike) 1)
-       (zerop (lexical-variable-write-count varlike))))
+       (zerop (lexical-variable-write-count varlike))
+       ;; Don't move D-X variables forwards, this runs the risk
+       ;; of them losing their D-X nature and causing allocations.
+       (not (lexical-variable-dynamic-extent varlike))))
 
 (defmethod kt-form ((form ast-block) &optional target-variable replacement-form)
   (multiple-value-bind (new-body did-replace)
@@ -119,7 +144,8 @@
                (unless replaced-last-binding
                  (push (car (last bindings)) new-bindings))
                (values (ast `(let ,(reverse new-bindings)
-                               ,new-form))
+                               ,new-form)
+                            form)
                        did-replace)))))))
 
 (defmethod kt-form ((form ast-multiple-value-bind) &optional target-variable replacement-form)

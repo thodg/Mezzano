@@ -8,16 +8,20 @@
   (pixels (error "Pixel data not specified."))
   (format (error "Format not specified.")))
 
+(defmethod print-object ((object surface) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S" (surface-format object))))
+
 (defun make-surface (width height &key (format :argb32) (initial-colour 0))
   "Create a new surface of the specified WIDTH, HEIGHT and FORMAT.
 The surface will be filled with INITIAL-COLOUR, which defaults to fully transparent."
   (check-type format (member :argb32 :a8 :a1))
   (%make-surface :pixels (make-array (list height width)
-                                        :element-type (ecase format
-                                                        (:argb32 '(unsigned-byte 32))
-                                                        (:a8 '(unsigned-byte 8))
-                                                        (:a1 'bit))
-                                        :initial-element initial-colour)
+                                     :element-type (ecase format
+                                                     (:argb32 '(unsigned-byte 32))
+                                                     (:a8 '(unsigned-byte 8))
+                                                     (:a1 'bit))
+                                     :initial-element initial-colour)
                  :format format))
 
 (defun make-surface-from-array (array &key (format :argb32) premultiplied)
@@ -79,25 +83,33 @@ premultiplied alpha unless PREMULTIPLIED is true."
   "Copy a WIDTHxHEIGHT rectangle of pixels from SOURCE-SURFACE to DEST-SURFACE.
 SOURCE-X,SOURCE-Y specify the top-left pixel in the source rectangle,
 DEST-X,DEST-Y specify the top-left pixel in the destination rectangle.
-MODE can be :SET, :BLEND, or :XOR.
+MODE can be :SET, :BLEND, :XOR, or a COLOUR-MATRIX.
 :SET will replace destination pixels with source pixels.
 :BLEND will alpha blend destination pixels with source pixels using the over operator.
 :XOR will exclusive-or destination pixels with source pixels.
 The :XOR blend mode may interact poorly with pixels that are not fully opaque.
+A COLOUR-MATRIX is equivalent to :SET, but will transform the copied pixels
+using the matrix.
 The rectangle will be clipped so that it is fully inside SOURCE/DEST."
-  (ecase mode
-    (:set
+  (etypecase mode
+    ((eql :set)
      (2d-array-bitblt
       height width
       (surface-pixels source-surface) source-y source-x
       (surface-pixels dest-surface) dest-y dest-x))
-    (:blend
+    ((eql :blend)
      (2d-array-bitblt-blend
       height width
       (surface-pixels source-surface) source-y source-x
       (surface-pixels dest-surface) dest-y dest-x))
-    (:xor
+    ((eql :xor)
      (2d-array-bitblt-xor
+      height width
+      (surface-pixels source-surface) source-y source-x
+      (surface-pixels dest-surface) dest-y dest-x))
+    (colour-matrix
+     (2d-array-bitblt-matrix
+      mode
       height width
       (surface-pixels source-surface) source-y source-x
       (surface-pixels dest-surface) dest-y dest-x))))

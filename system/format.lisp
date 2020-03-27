@@ -1,10 +1,10 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(cl:defpackage :sys.format
-  (:use :cl #:sys.int))
+(defpackage :mezzano.format
+  (:use :cl))
 
-(in-package :sys.format)
+(in-package :mezzano.format)
 
 (defstruct directive
   character
@@ -190,7 +190,7 @@
         (colon-sym (or colon (gensym "Colon"))))
     `(setf (format-interpreter ',character)
            (lambda (,arguments ,at-sign-sym ,colon-sym ,@parameter-lambda-list)
-             (declare (system:lambda-name (format-interpreter ,character)))
+             (declare (mezzano.internals::lambda-name (format-interpreter ,character)))
              (block nil
                ,@(when (not at-sign)
                        (list `(when ,at-sign-sym
@@ -207,59 +207,59 @@
                  ,@body
                  ,arguments))))))
 
-(defun format-integer (n base params at-sign colon)
+(defun format-integer (stream n base params at-sign colon)
   (let ((mincol (first params))
-	(padchar (or (second params) #\Space))
-	(commachar (or (third params) #\,))
-	(comma-interval (or (fourth params) 3)))
+        (padchar (or (second params) #\Space))
+        (commachar (or (third params) #\,))
+        (comma-interval (or (fourth params) 3)))
     (unless (integerp n)
       (return-from format-integer
         (let ((*print-base* base))
-          (write n :escape nil :readably nil))))
+          (write n :stream stream :escape nil :readably nil))))
     (check-type padchar character)
     (check-type commachar character)
     (check-type comma-interval integer)
     (when (cddddr params)
       (error "Expected 0 to 4 parameters."))
     (if (or mincol colon)
-	;; Fancy formatting.
-	(let ((buffer (make-array 8
-				  :element-type 'character
-				  :adjustable t
-				  :fill-pointer 0))
-	      (negative nil))
-	  (when (minusp n)
-	    (setf negative t
-		  n (- n)))
-	  (unless mincol (setf mincol 0))
+        ;; Fancy formatting.
+        (let ((buffer (make-array 8
+                                  :element-type 'character
+                                  :adjustable t
+                                  :fill-pointer 0))
+              (negative nil))
+          (when (minusp n)
+            (setf negative t
+                  n (- n)))
+          (unless mincol (setf mincol 0))
           ;; Write the number backwards into the buffer, no commas or padding yet.
-	  (if (= n 0)
-	      (vector-push-extend #\0 buffer)
-	      (do () ((= n 0))
-		(multiple-value-bind (quot rem)
-		    (truncate n base)
-		  (vector-push-extend (char "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" rem) buffer)
-		  (setf n quot))))
-	  ;; TODO: count commas as well
-	  (dotimes (i (- mincol (+ (length buffer) (if (or negative at-sign) 1 0))))
-	    (write-char padchar))
+          (if (= n 0)
+              (vector-push-extend #\0 buffer)
+              (do () ((= n 0))
+                (multiple-value-bind (quot rem)
+                    (truncate n base)
+                  (vector-push-extend (char "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" rem) buffer)
+                  (setf n quot))))
+          ;; TODO: count commas as well
+          (dotimes (i (- mincol (+ (length buffer) (if (or negative at-sign) 1 0))))
+            (write-char padchar stream))
           (cond
             (negative
-             (write-char #\-))
+             (write-char #\- stream))
             (at-sign
-             (write-char #\+)))
-	  (if colon
-	      (dotimes (i (length buffer))
-		(when (and (not (zerop i))
+             (write-char #\+ stream)))
+          (if colon
+              (dotimes (i (length buffer))
+                (when (and (not (zerop i))
                            (zerop (rem (- (length buffer) i) comma-interval)))
-		  (write-char commachar))
-		(write-char (char buffer (- (length buffer) i 1))))
-	      (dotimes (i (length buffer))
-		(write-char (char buffer (- (length buffer) i 1))))))
-	(progn
-	  (when (and at-sign (not (minusp n)))
-	    (write-char #\+))
-	  (write n :escape nil :radix nil :base base :readably nil)))))
+                  (write-char commachar stream))
+                (write-char (char buffer (- (length buffer) i 1)) stream))
+              (dotimes (i (length buffer))
+                (write-char (char buffer (- (length buffer) i 1)) stream))))
+        (progn
+          (when (and at-sign (not (minusp n)))
+            (write-char #\+ stream))
+          (write n :stream stream :escape nil :radix nil :base base :readably nil)))))
 
 (defvar *cardinal-names-1*
   '("zero" "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"
@@ -268,9 +268,9 @@
   '("zero" "ten" "twenty" "thirty" "forty" "fifty" "sixty" "seventy" "eighty" "ninety"))
 (defvar *ordinal-names-1*
   '("zeroth" "first" "second" "third" "fourth" "fifth" "sixth" "seventh" "eighth" "ninth"
-    "tenth" "eleventh" "twelveth" "thirteenth" "fourteenth" "fifteenth" "sixteenth" "seventeenth" "eighteenth" "nineteenth"))
+    "tenth" "eleventh" "twelfth" "thirteenth" "fourteenth" "fifteenth" "sixteenth" "seventeenth" "eighteenth" "nineteenth"))
 (defvar *ordinal-names-10*
-  '("zeroth" "tenth" "twenieth" "thirtieth" "fortieth" "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
+  '("zeroth" "tenth" "twentieth" "thirtieth" "fortieth" "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
 (defvar *radix-powers*
   '((1000000 "million" "millionth") (1000 "thousand" "thousandth") (100 "hundred" "hundredth")))
 
@@ -286,17 +286,17 @@
            (write-string (elt *cardinal-names-10* quot) stream)
            (unless (zerop rem)
              (write-char #\- stream)
-             (cardinal rem stream))))
+             (print-cardinal rem stream))))
         (t (loop for (power cardinal ordinal) in *radix-powers*
               when (>= integer power) do
                 (multiple-value-bind (quot rem)
                     (truncate integer power)
-                  (cardinal quot stream)
+                  (print-cardinal quot stream)
                   (write-char #\Space stream)
                   (write-string cardinal stream)
                   (unless (zerop rem)
                     (write-char #\Space stream)
-                    (cardinal rem stream)))
+                    (print-cardinal rem stream)))
                 (return)
               finally (error "Number ~:D too large to be printed as a cardinal number." integer)))))
 
@@ -313,37 +313,39 @@
                   (write-string (elt *ordinal-names-10* quot) stream))
                  (t (write-string (elt *cardinal-names-10* quot) stream)
                     (write-char #\- stream)
-                    (ordinal rem stream)))))
+                    (print-ordinal rem stream)))))
         (t (loop for (power cardinal ordinal) in *radix-powers*
               when (>= integer power) do
                 (multiple-value-bind (quot rem)
                     (truncate integer power)
-                  (cardinal quot stream)
+                  (print-cardinal quot stream)
                   (write-char #\Space stream)
                   (cond ((zerop rem)
                          (write-string ordinal stream))
                         (t (write-string cardinal stream)
                            (write-char #\Space stream)
-                           (ordinal rem stream))))
+                           (print-ordinal rem stream))))
                 (return)
               finally (error "Number ~:D too large to be printed as an ordinal number." integer)))))
 
 ;;;; 22.3.1 FORMAT Basic Output.
 
+(defun format-character (stream c at-sign colon)
+  (check-type c character)
+  (cond ((and at-sign (not colon))
+         (write c :stream stream :escape t))
+        (colon
+         (if (and (graphic-char-p c) (not (eql #\Space c)))
+             (write-char c stream)
+             (write-string (char-name c) stream))
+         ;; TODO: colon & at-sign.
+         ;; Describes how to type the character if it requires
+         ;; unusual shift keys to type.
+         (when at-sign))
+        (t (write-char c stream))))
+
 (define-format-interpreter #\C (at-sign colon)
-  (let ((c (consume-argument)))
-    (check-type c character)
-    (cond ((and at-sign (not colon))
-           (write c :escape t))
-	  (colon
-           (if (and (graphic-char-p c) (not (eql #\Space c)))
-               (write-char c)
-               (write-string (char-name c)))
-           ;; TODO: colon & at-sign.
-           ;; Describes how to type the character if it requires
-           ;; unusual shift keys to type.
-           (when at-sign))
-          (t (write-char c)))))
+  (format-character *standard-output* (consume-argument) at-sign colon))
 
 (define-format-interpreter #\% (at-sign colon &optional n)
   (check-type n (or integer null))
@@ -369,36 +371,40 @@
 
 ;;;; 22.3.2 FORMAT Radix Control.
 
+(defun format-radix (stream arg params at-sign colon)
+  (cond
+    (params
+     (let ((base (or (first params) 10)))
+       (check-type base integer)
+       (format-integer stream arg
+                       base (rest params)
+                       at-sign colon)))
+    (at-sign
+     (error "TODO: Roman numerals."))
+    (colon
+     (print-ordinal arg stream))
+    (t
+     (print-cardinal arg stream))))
+
 (define-format-interpreter #\R (at-sign colon &rest params)
-  (let ((arg (consume-argument)))
-    (cond
-      (params
-       (let ((base (or (first params) 10)))
-         (check-type base integer)
-         (format-integer arg
-                         base (rest params)
-                         at-sign colon)))
-      (at-sign
-       (error "TODO: Roman numerals."))
-      (colon
-       (print-ordinal arg *standard-output*))
-      (t
-       (print-cardinal arg *standard-output*)))))
+  (format-radix *standard-output*
+                (consume-argument)
+                params at-sign colon))
 
 (define-format-interpreter #\D (at-sign colon &rest params)
-  (format-integer (consume-argument)
+  (format-integer *standard-output* (consume-argument)
                   10 params at-sign colon))
 
 (define-format-interpreter #\B (at-sign colon &rest params)
-  (format-integer (consume-argument)
+  (format-integer *standard-output* (consume-argument)
                   2 params at-sign colon))
 
 (define-format-interpreter #\O (at-sign colon &rest params)
-  (format-integer (consume-argument)
+  (format-integer *standard-output* (consume-argument)
                   8 params at-sign colon))
 
 (define-format-interpreter #\X (at-sign colon &rest params)
-  (format-integer (consume-argument)
+  (format-integer *standard-output* (consume-argument)
                   16 params at-sign colon))
 
 ;;;; 22.3.3 FORMAT Floating-Point Printers.
@@ -407,7 +413,7 @@
 (define-format-interpreter #\$ (at-sign colon &optional (d 2) (n 1) (w 0) (padchar #\Space))
   (let ((arg (consume-argument)))
     (when (realp arg)
-      (setf arg (float 0.0s0)))
+      (setf arg (float 0.0f0)))
     (format t "~D" arg)))
 
 ;;;; 22.3.4 FORMAT Printer Operations.
@@ -477,11 +483,11 @@
         (at-sign
          (dotimes (i colnum)
            (write-char #\Space))
-         (let ((current (sys.gray:stream-line-column *standard-output*)))
+         (let ((current (mezzano.gray:stream-line-column *standard-output*)))
            (when current
              (dotimes (i (- colinc (rem current colinc)))
                (write-char #\Space)))))
-        (t (let ((current (sys.gray:stream-line-column *standard-output*)))
+        (t (let ((current (mezzano.gray:stream-line-column *standard-output*)))
              (cond ((not current)
                     (write-string "  "))
                    ((< current colnum)
@@ -607,7 +613,7 @@
   (when params (error "~~( Expects no parameters."))
   (when (or end-at-sign end-colon)
     (error "~~) does not take the at-sign or colon modifiers."))
-  (let ((*standard-output* (sys.int::make-case-correcting-stream
+  (let ((*standard-output* (mezzano.internals::make-case-correcting-stream
                             *standard-output*
                             (cond ((and colon at-sign)
                                    :upcase)
@@ -703,9 +709,12 @@
          (do-format stream)))
       ((and (stringp destination)
             (array-has-fill-pointer-p destination))
-       (do-format (make-instance 'sys.int::string-output-stream
-                                 :element-type 'character
-                                 :string destination)))
+       (do-format (locally
+                      ;; ### Bootstrap hack.
+                      (declare (notinline make-instance))
+                    (make-instance 'mezzano.internals::string-output-stream
+                                   :element-type 'character
+                                   :string destination))))
       ((eql destination 't)
        (do-format *standard-output*))
       ((streamp destination)

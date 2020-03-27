@@ -48,13 +48,11 @@
 
 ;;;; LOOP Iteration Macro
 
-(defpackage :sys.loop
-  (:use #:cl))
+(defpackage :mezzano.loop
+  (:use #:cl)
+  (:local-nicknames (:sys.int :mezzano.internals)))
 
-#+allegro
-(in-package :excl)
-#-allegro
-(in-package #:sys.loop)
+(in-package #:mezzano.loop)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 #+ignore(provide :loop)
@@ -147,9 +145,12 @@
       (gensym (string pref))))
 
 
+;; FIXME: This used to be 'real, but that really puts pressure on the
+;; compiler to be smart now. Unfortunately it isn't smart, so...
+(defvar *loop-real-data-type* 't)
 
-(defvar *loop-real-data-type* 'real)
-
+;; FIXME: Likewise, but 'list.
+(defvar *loop-list-data-type* 't)
 
 (defun loop-optimization-quantities (env)
   ;;@@@@ The ANSI conditionalization here is for those lisps that implement
@@ -231,6 +232,7 @@
 		      (let ((,tail-var ,head-var) ,@l)
 			,@body))
 	    #-CLOE `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
+                      (declare (dynamic-extent ,head-var))
 		      ,@body)))
 
 
@@ -241,7 +243,7 @@
     )
   (setq form (sys.int::macroexpand form env))
   (flet ((cdr-wrap (form n)
-	   (declare (fixnum n))
+	   (declare (type fixnum n))
 	   (do () ((<= n 4) (setq form `(,(case n
 					    (1 'cdr)
 					    (2 'cddr)
@@ -324,32 +326,11 @@ constructed.
 
 
 (defvar *loop-minimax-type-infinities-alist*
-	;;@@@@ This is the sort of value this should take on for a Lisp that has
-	;; "eminently usable" infinities.  n.b. there are neither constants nor
-	;; printed representations for infinities defined by CL.
-	;;@@@@ This grotesque read-from-string below is to help implementations
-	;; which croak on the infinity character when it appears in a token, even
-	;; conditionalized out.
-	#+Genera
-	  '#.(read-from-string
-	      "((fixnum 	most-positive-fixnum	 most-negative-fixnum)
-		(short-float 	+1s			 -1s)
-		(single-float	+1f			 -1f)
-		(double-float	+1d			 -1d)
-		(long-float	+1l			 -1l))")
-	;;This is how the alist should look for a lisp that has no infinities.  In
-	;; that case, MOST-POSITIVE-x-FLOAT really IS the most positive.
-	#+(or CLOE-Runtime Minima)
-	  '((fixnum   		most-positive-fixnum		most-negative-fixnum)
-	    (short-float	most-positive-short-float	most-negative-short-float)
-	    (single-float	most-positive-single-float	most-negative-single-float)
-	    (double-float	most-positive-double-float	most-negative-double-float)
-	    (long-float		most-positive-long-float	most-negative-long-float))
-	;;If we don't know, then we cannot provide "infinite" initial values for any of the
-	;; types but FIXNUM:
-	#-(or Genera CLOE-Runtime Minima)
-	  '((fixnum   		most-positive-fixnum		most-negative-fixnum))
-	  )
+  '((fixnum   		most-positive-fixnum		most-negative-fixnum)
+    (short-float	sys.int::short-float-positive-infinity	sys.int::short-float-negative-infinity)
+    (single-float	sys.int::single-float-positive-infinity	sys.int::single-float-negative-infinity)
+    (double-float	sys.int::double-float-positive-infinity	sys.int::double-float-negative-infinity)
+    (long-float		sys.int::long-float-positive-infinity	sys.int::long-float-negative-infinity)))
 
 
 (defun make-loop-minimax (answer-variable type)
@@ -372,7 +353,7 @@ constructed.
 
 
 (defmacro with-minimax-value (lm &body body)
-  (let ((init (loop-typed-init (loop-minimax-type lm)))
+  (let ((init (or (loop-typed-init (loop-minimax-type lm)) 0))
 	(which (car (loop-minimax-operations lm)))
 	(infinity-data (loop-minimax-infinity-data lm))
 	(answer-var (loop-minimax-answer-variable lm))
@@ -493,7 +474,9 @@ code to be loaded.
   #-(and CLOE Source-Bootstrap) (check-type ansi (member nil t :extended))
   (flet ((maketable (entries)
 	   (let* ((size (length entries))
-		  (ht (make-hash-table :size (if (< size 10) 10 size) :test #'equal)))
+                  ;; The standard loop universe is read during compliation but only
+                  ;; initialized here.
+		  (ht (make-hash-table :test #'equal :enforce-gc-invariant-keys t)))
 	     (dolist (x entries) (setf (gethash (symbol-name (car x)) ht) (cadr x)))
 	     ht)))
     (make-loop-universe
@@ -505,7 +488,7 @@ code to be loaded.
       :implicit-for-required (not (null ansi))
       :type-keywords (maketable type-keywords)
       :type-symbols (let* ((size (length type-symbols))
-			   (ht (make-hash-table :size (if (< size 10) 10 size) :test #'eq)))
+			   (ht (make-hash-table :test #'eq :enforce-gc-invariant-keys t)))
 		      (dolist (x type-symbols)
 			(if (atom x) (setf (gethash x ht) x) (setf (gethash (car x) ht) (cadr x))))
 		      ht))))
@@ -793,7 +776,7 @@ a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.
     ;; This outer loop iterates once for each not-first-time flag test generated
     ;; plus once more for the forms that don't need a flag test
     (do ((threshold (loop-code-duplication-threshold env))) (nil)
-      (declare (fixnum threshold))
+      (declare (type fixnum threshold))
       ;; Go backwards from the ends of before-loop and after-loop merging all the equivalent
       ;; forms into the body.
       (do () ((or (null rbefore) (not (equal (car rbefore) (car rafter)))))
@@ -842,7 +825,7 @@ a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.
 (defun duplicatable-code-p (expr env)
   (if (null expr) 0
       (let ((ans (estimate-code-size expr env)))
-	(declare (fixnum ans))
+	(declare (type fixnum ans))
 	;;@@@@ Use (DECLARATION-INFORMATION 'OPTIMIZE ENV) here to get an alist of
 	;; optimize quantities back to help quantify how much code we are willing to
 	;; duplicate.
@@ -887,7 +870,7 @@ a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.
 (defun estimate-code-size-1 (x env)
   (flet ((list-size (l)
 	   (let ((n 0))
-	     (declare (fixnum n))
+	     (declare (type fixnum n))
 	     (dolist (x l n) (incf n (estimate-code-size-1 x env))))))
     ;;@@@@ ???? (declare (function list-size (list) fixnum))
     (cond ((constantp x #+Genera env) 1)
@@ -896,7 +879,7 @@ a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.
 	  ((atom x) 1)				;??? self-evaluating???
 	  ((symbolp (car x))
 	   (let ((fn (car x)) (tem nil) (n 0))
-	     (declare (symbol fn) (fixnum n))
+	     (declare (type symbol fn) (type fixnum n))
 	     (macrolet ((f (overhead &optional (args nil args-p))
 			  `(the fixnum (+ (the fixnum ,overhead)
 					  (the fixnum (list-size ,(if args-p args '(cdr x))))))))
@@ -1013,9 +996,6 @@ collected result will be returned as the value of the LOOP."
 		     ,(nreverse *loop-body*)
 		     ,(nreverse *loop-after-body*)
 		     ,(nreconc *loop-epilogue* (nreverse *loop-after-epilogue*)))))
-      (do () (nil)
-	(setq answer `(block ,(pop *loop-names*) ,answer))
-	(unless *loop-names* (return nil)))
       (dolist (entry *loop-bind-stack*)
 	(let ((vars (first entry))
 	      (dcls (second entry))
@@ -1035,6 +1015,7 @@ collected result will be returned as the value of the LOOP."
 				   `((destructuring-bind ,@crocks
 					 ,@forms))
 				 forms)))))))
+      (setf answer `(block ,(first *loop-names*) ,answer))
       answer)))
 
 
@@ -1108,10 +1089,20 @@ collected result will be returned as the value of the LOOP."
 
 
 (defun loop-typed-init (data-type)
-  (when (and data-type (subtypep data-type 'number))
-    (if (or (subtypep data-type 'float) (subtypep data-type '(complex float)))
-	(coerce 0 data-type)
-	0)))
+  (when data-type
+    ;; FIXME: This should pass the macro environment to typeexpand.
+    (let ((expanded-type (sys.int::typeexpand data-type)))
+      ;; Best effort... TODO: Make this more complete.
+      (cond ((or (subtypep expanded-type 'float)
+                 (subtypep expanded-type '(complex float)))
+             (coerce 0 data-type))
+            ((subtypep expanded-type 'number)
+             0)
+            ((subtypep expanded-type 'vector)
+             ;; FIXME: This doesn't work for sized vectors.
+             (coerce nil expanded-type))
+            (t
+             nil)))))
 
 
 (defun loop-optional-type (&optional variable)
@@ -1303,7 +1294,7 @@ collected result will be returned as the value of the LOOP."
     (when *loop-names*
       (loop-error "You may only use one NAMED clause in your loop: NAMED ~S ... NAMED ~S."
 		  (car *loop-names*) name))
-    (setq *loop-names* (list name nil))))
+    (setq *loop-names* (list name))))
 
 (defun loop-do-return ()
   (loop-pseudo-body (loop-construct-return (loop-get-form))))
@@ -1492,7 +1483,7 @@ collected result will be returned as the value of the LOOP."
       (setq pseudo-steps (nconc pseudo-steps (loop-copylist* (car (setq tem (cdr tem))))))
       (setq tem (cdr tem))
       (when *loop-emitted-body*
-	(loop-error "Iteration in LOOP follows body code."))
+	(warn "Iteration in LOOP follows body code."))
       (unless tem (setq tem data))
       (when (car tem) (push (car tem) pre-loop-pre-step-tests))
       (setq pre-loop-steps (nconc pre-loop-steps (loop-copylist* (car (setq tem (cdr tem))))))
@@ -1602,7 +1593,7 @@ collected result will be returned as the value of the LOOP."
 	     (other-test first-test)
 	     (step `(,var (aref ,vector-var ,index-var)))
 	     (pstep `(,index-var (1+ ,index-var))))
-	(declare (fixnum length))
+	(declare (type fixnum length))
 	(when constantp
 	  (setq first-test (= length 0))
 	  (when (<= length 1)
@@ -1639,7 +1630,7 @@ collected result will be returned as the value of the LOOP."
   (multiple-value-bind (list constantp list-value) (loop-constant-fold-if-possible val)
     (let ((listvar var))
       (cond ((and var (symbolp var)) (loop-make-iteration-variable var list data-type))
-	    (t (loop-make-variable (setq listvar (loop-gentemp)) list 'list)
+	    (t (loop-make-variable (setq listvar (loop-gentemp)) list *loop-list-data-type*)
 	       (loop-make-iteration-variable var nil data-type)))
       (multiple-value-bind (list-step step-function) (loop-list-step listvar)
 	(declare #+(and (not LOOP-Prefer-POP) (not CLOE)) (ignore step-function))
@@ -1677,7 +1668,7 @@ collected result will be returned as the value of the LOOP."
   (multiple-value-bind (list constantp list-value) (loop-constant-fold-if-possible val)
     (let ((listvar (loop-gentemp 'loop-list-)))
       (loop-make-iteration-variable var nil data-type)
-      (loop-make-variable listvar list 'list)
+      (loop-make-variable listvar list *loop-list-data-type*)
       (multiple-value-bind (list-step step-function) (loop-list-step listvar)
 	#-LOOP-Prefer-POP (declare (ignore step-function))
 	(let* ((first-endtest `(endp ,listvar))
@@ -1776,7 +1767,7 @@ collected result will be returned as the value of the LOOP."
 ;;; i.e., this is part of our extended ansi-loop interface.
 (defun named-variable (name)
   (let ((tem (loop-tassoc name *loop-named-variables*)))
-    (declare (list tem))
+    (declare (type list tem))
     (cond ((null tem) (values (loop-gentemp) nil))
 	  (t (setq *loop-named-variables* (delete tem *loop-named-variables*))
 	     (values (cdr tem) t)))))
@@ -1795,7 +1786,7 @@ collected result will be returned as the value of the LOOP."
 		   initial-phrases))
 	 (used-prepositions (mapcar #'car initial-phrases)))
 	((null *loop-source-code*) (nreverse prepositional-phrases))
-      (declare (symbol this-prep))
+      (declare (type symbol this-prep))
       (setq token (car *loop-source-code*))
       (dolist (group preposition-groups)
 	(when (setq this-prep (in-group-p token group))

@@ -1,7 +1,7 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
 (defvar *load-verbose* nil)
 (defvar *load-print* nil)
@@ -10,10 +10,12 @@
 (defvar *load-truename* nil)
 
 (defvar *modules* '())
-(defvar *require-hooks* '())
+(defvar *module-provider-functions* '())
 
 (defvar *noisy-load* nil)
 (defvar *load-wired* nil "When true, allocate objects in the wired area.")
+
+(defvar *load-if-stack*)
 
 (defun llf-command-name (command)
   (ecase command
@@ -23,12 +25,8 @@
     (#.+llf-cons+ 'cons)
     (#.+llf-symbol+ 'symbol)
     (#.+llf-uninterned-symbol+ 'uninterned-symbol)
-    (#.+llf-unbound+ 'unbound)
     (#.+llf-string+ 'string)
-    (#.+llf-setf-symbol+ 'setf-symbol)
     (#.+llf-integer+ 'integer)
-    (#.+llf-invoke+ 'invoke)
-    (#.+llf-setf-fdefinition+ 'setf-fdefinition)
     (#.+llf-simple-vector+ 'simple-vector)
     (#.+llf-character+ 'character)
     (#.+llf-character-with-bits+ 'character-with-bits)
@@ -41,10 +39,35 @@
     (#.+llf-add-backlink+ 'add-backlink)
     (#.+llf-ratio+ 'ratio)
     (#.+llf-array+ 'array)
-    (#.+llf-funcall+ 'funcall)
     (#.+llf-bit-vector+ 'bit-vector)
     (#.+llf-function-reference+ 'function-reference)
-    (#.+llf-byte+ 'byte)))
+    (#.+llf-byte+ 'byte)
+    (#.+llf-double-float+ 'double-float)
+    (#.+llf-typed-array+ 'typed-array)
+    (#.+llf-funcall-n+ 'funcall-n)
+    (#.+llf-drop+ 'drop)
+    (#.+llf-complex-rational+ 'complex-rational)
+    (#.+llf-complex-single-float+ 'complex-single-float)
+    (#.+llf-complex-double-float+ 'complex-double-float)
+    (#.+llf-instance-header+ 'instance-header)
+    (#.+llf-symbol-global-value-cell+ 'symbol-global-value-cell)
+    (#.+llf-if+ 'if)
+    (#.+llf-else+ 'else)
+    (#.+llf-fi+ 'fi)
+    (#.+llf-layout+ 'layout)
+    (#.+llf-initialize-array+ 'initialize-array)))
+
+(defun llf-architecture-name (id)
+  (case id
+    (#.+llf-arch-x86-64+ :x86-64)
+    (#.+llf-arch-arm64+ :arm64)
+    (t :unknown)))
+
+(defun current-architecture ()
+  #+x86-64 :x86-64
+  #+arm64 :arm64
+  #-(or x86-64 arm64)
+  (error "Define this"))
 
 (defun check-llf-header (stream)
   (assert (and (eql (%read-byte stream) #x4C)
@@ -58,7 +81,11 @@
     (assert (eql version *llf-version*)
             ()
             "Bad LLF version ~D, wanted version ~D, while loading ~S."
-            version *llf-version* stream)))
+            version *llf-version* stream))
+  (let ((arch (llf-architecture-name (load-integer stream))))
+    (assert (eql arch (current-architecture)) ()
+            "LLF compiled for wrong architecture ~S. Wanted ~S."
+            arch (current-architecture))))
 
 (defun load-integer (stream)
   (let ((value 0) (shift 0))
@@ -130,43 +157,51 @@
     (%read-sequence mc stream)
     ;; Read gc-info bytes.
     (%read-sequence gc-info stream)
-    (make-function-with-fixups tag mc fixups constants gc-info *load-wired*)))
+    (make-function tag mc fixups constants gc-info *load-wired*)))
 
 (defun load-llf-vector (stream stack)
-  (let* ((len (load-integer stream))
-         (vector (subseq stack (- (length stack) len))))
-    ;; Drop vector values.
-    (decf (fill-pointer stack) len)
-    (if *load-wired*
-        (make-array (length vector)
-                    :initial-contents vector
-                    :area :wired)
-        vector)))
+  (let ((len (load-integer stream)))
+    (make-array len :area (if *load-wired* :wired nil))))
 
 (defun structure-slot-definition-compatible (x y)
-  (and (eql (structure-slot-name x) (structure-slot-name y))
-       (equal (structure-slot-type x) (structure-slot-type y))))
+  (and (eql (structure-slot-definition-name x) (structure-slot-definition-name y))
+       (equal (structure-slot-definition-type x) (structure-slot-definition-type y))
+       (eql (structure-slot-definition-location x) (structure-slot-definition-location y))))
 
 (defun load-llf-structure-definition (stream stack)
-  (let* ((area (vector-pop stack))
-         (parent (vector-pop stack))
-         (slots (vector-pop stack))
-         (name (vector-pop stack))
-         (definition (get name 'structure-type)))
-    (cond (definition
-           (unless (and (eql (length (structure-slots definition)) (length slots))
-                        (every #'structure-slot-definition-compatible (structure-slots definition) slots))
-             (error "Incompatible redefinition of structure. ~S ~S ~S~%" definition (structure-slots definition) slots))
-           definition)
-          (t (make-struct-definition name slots parent area)))))
+  (declare (ignore stream))
+  (let ((has-standard-constructor (vector-pop stack))
+        (docstring (vector-pop stack))
+        (sealed (vector-pop stack))
+        (layout (vector-pop stack))
+        (size (vector-pop stack))
+        (area (vector-pop stack))
+        (parent (vector-pop stack))
+        (slots (vector-pop stack))
+        (name (vector-pop stack)))
+    ;; Defstruct converts structure definitions to structure classes.
+    (%defstruct (make-struct-definition name
+                                        slots
+                                        parent
+                                        area
+                                        size
+                                        layout
+                                        sealed
+                                        docstring
+                                        has-standard-constructor))))
 
 (defun load-llf-structure-slot-definition (stream stack)
-  (let* ((read-only (vector-pop stack))
+  (declare (ignore stream))
+  (let* ((documentation (vector-pop stack))
+         (align (vector-pop stack))
+         (fixed-vector (vector-pop stack))
+         (location (vector-pop stack))
+         (read-only (vector-pop stack))
          (type (vector-pop stack))
          (initform (vector-pop stack))
          (accessor (vector-pop stack))
          (name (vector-pop stack)))
-    (make-struct-slot-definition name accessor initform type read-only)))
+    (make-struct-slot-definition name accessor initform type read-only location fixed-vector align documentation)))
 
 (defun load-llf-array (stream stack)
   (let* ((n-dimensions (load-integer stream))
@@ -180,11 +215,27 @@
     (decf (fill-pointer stack) n-elements)
     array))
 
-(defvar *magic-unbound-value* (cons "Magic unbound value" nil))
+(defun load-llf-typed-array (stream stack)
+  (let* ((n-dimensions (load-integer stream))
+         (dimensions (loop for i from 0 below n-dimensions
+                        collect (load-integer stream)))
+         (element-type (vector-pop stack))
+         (array (make-array dimensions
+                            :area (if *load-wired* :wired nil)
+                            :element-type element-type))
+         (n-elements (array-total-size array))
+         (start (- (length stack) n-elements)))
+    (dotimes (i n-elements)
+      (setf (row-major-aref array i) (aref stack (+ start i))))
+    (decf (fill-pointer stack) n-elements)
+    array))
+
+(defun load-inhibited ()
+  (and *load-if-stack*
+       (or (not (first *load-if-stack*))
+           (eql (first *load-if-stack*) :inhibit))))
 
 (defun load-one-object (command stream stack)
-  (when *noisy-load*
-    (format t "~S~%" (llf-command-name command)))
   (ecase command
     (#.+llf-function+
      (load-llf-function stream stack))
@@ -197,29 +248,10 @@
             (package (load-string stream)))
        (intern name package)))
     (#.+llf-uninterned-symbol+
-     (let* ((plist (vector-pop stack))
-            (fn (vector-pop stack))
-            (value (vector-pop stack))
-            (name (vector-pop stack))
-            (symbol (make-symbol name)))
-       (setf (symbol-plist symbol) plist)
-       (unless (eql fn *magic-unbound-value*)
-         (setf (symbol-function symbol) fn))
-       (unless (eql value *magic-unbound-value*)
-         (setf (symbol-value symbol) value))
-       symbol))
-    (#.+llf-unbound+ *magic-unbound-value*)
+     (let ((name (vector-pop stack)))
+       (make-symbol name)))
     (#.+llf-string+ (load-string stream))
     (#.+llf-integer+ (load-integer stream))
-    (#.+llf-invoke+
-     (let ((fn (vector-pop stack)))
-       (funcall fn))
-     (values))
-    (#.+llf-setf-fdefinition+
-     (let ((name (vector-pop stack))
-           (fn (vector-pop stack)))
-       (setf (fdefinition name) fn))
-     (values))
     (#.+llf-simple-vector+
      (load-llf-vector stream stack))
     (#.+llf-character+ (load-character stream))
@@ -233,6 +265,8 @@
      (load-llf-structure-slot-definition stream stack))
     (#.+llf-single-float+
      (%integer-as-single-float (load-integer stream)))
+    (#.+llf-double-float+
+     (%integer-as-double-float (load-integer stream)))
     (#.+llf-proper-list+
      (let ((list '())
            (len (load-integer stream)))
@@ -250,12 +284,11 @@
          (setf (aref vec i) (load-integer stream)))
        vec))
     (#.+llf-ratio+
-     (/ (load-integer stream)
-        (load-integer stream)))
+     (let* ((num (load-integer stream))
+            (denom (load-integer stream)))
+       (/ num denom)))
     (#.+llf-array+
      (load-llf-array stream stack))
-    (#.+llf-funcall+
-     (values (funcall (vector-pop stack))))
     (#.+llf-bit-vector+
      (let* ((len (load-integer stream))
             (n-octets (ceiling len 8))
@@ -271,16 +304,95 @@
      (function-reference (vector-pop stack)))
     (#.+llf-byte+
      (byte (load-integer stream)
-           (load-integer stream)))))
+           (load-integer stream)))
+    (#.+llf-typed-array+
+     (load-llf-typed-array stream stack))
+    (#.+llf-funcall-n+
+     (let* ((n-args (vector-pop stack))
+            (fn (vector-pop stack))
+            (args (reverse (loop
+                              repeat n-args
+                              collect (vector-pop stack)))))
+       (cond ((load-inhibited)
+              :inhibited-funcall)
+             (t
+              (values (apply (if (functionp fn)
+                                 fn
+                                 (fdefinition fn))
+                             args))))))
+    (#.+llf-drop+
+     (vector-pop stack)
+     (values))
+    (#.+llf-complex-rational+
+     (let* ((realpart-numerator (load-integer stream))
+            (realpart-denominator (load-integer stream))
+            (realpart (/ realpart-numerator realpart-denominator))
+            (imagpart-numerator (load-integer stream))
+            (imagpart-denominator (load-integer stream))
+            (imagpart (/ imagpart-numerator imagpart-denominator)))
+       (complex realpart imagpart)))
+    (#.+llf-complex-single-float+
+     (let ((realpart (%integer-as-single-float (load-integer stream)))
+           (imagpart (%integer-as-single-float (load-integer stream))))
+       (complex realpart imagpart)))
+    (#.+llf-complex-double-float+
+     (let ((realpart (%integer-as-double-float (load-integer stream)))
+           (imagpart (%integer-as-double-float (load-integer stream))))
+       (complex realpart imagpart)))
+    (#.+llf-instance-header+
+     (let ((structure-class (vector-pop stack)))
+       (mezzano.runtime::%make-instance-header
+        (mezzano.runtime::instance-access-by-name structure-class 'mezzano.clos::slot-storage-layout))))
+    (#.+llf-symbol-global-value-cell+
+     (mezzano.runtime::symbol-global-value-cell (vector-pop stack)))
+    (#.+llf-if+
+     ;; Deal with nested IFs properly
+     (cond ((load-inhibited)
+            (vector-pop stack)
+            (push :inhibit *load-if-stack*))
+           (t
+            (push (not (not (vector-pop stack))) *load-if-stack*)))
+     (values))
+    (#.+llf-else+
+     (when (load-inhibited)
+       ;; Drop the then value
+       (vector-pop stack))
+     (when (not (eql (first *load-if-stack*) :inhibit))
+       (setf (first *load-if-stack*) (not (first *load-if-stack*))))
+     (values))
+    (#.+llf-fi+
+     (when (and (load-inhibited)
+                (not (eql (first *load-if-stack*) :inhibit)))
+       ;; Drop the else value unless then value was also dropped.
+       (vector-pop stack))
+     (pop *load-if-stack*)
+     (values))
+    (#.sys.int::+llf-layout+
+     (let ((structure-class (vector-pop stack)))
+       (mezzano.runtime::instance-access-by-name structure-class 'mezzano.clos::slot-storage-layout)))
+    (#.sys.int::+llf-initialize-array+
+     (let* ((len (load-integer stream))
+            (elements (subseq stack (- (length stack) len))))
+       ;; Drop vector values.
+       (decf (fill-pointer stack) len)
+       (let ((array (vector-pop stack)))
+         (dotimes (i len)
+           (setf (row-major-aref array i) (aref elements i)))
+         array)))))
 
 (defun load-llf (stream &optional (*load-wired* nil))
   (check-llf-header stream)
   (let ((*package* *package*)
+        (*load-if-stack* '())
         (omap (make-hash-table))
         (stack (make-array 64 :adjustable t :fill-pointer 0)))
     (loop (let ((command (%read-byte stream)))
             (case command
               (#.+llf-end-of-load+
+               (when *noisy-load*
+                 (format t "END-OF-LOAD~%"))
+               (when (not (eql (length stack) 0))
+                 (error "Bug! Stack not empty after LLF load."))
                (return))
               (#.+llf-backlink+
                (let ((id (load-integer stream)))
@@ -288,6 +400,8 @@
                      (gethash id omap)
                    (unless value-p
                      (error "Unknown backlink ID ~D." id))
+                   (when *noisy-load*
+                     (format t "BACKLINK ~S~%" id))
                    (vector-push-extend value stack))))
               (#.+llf-add-backlink+
                (let ((id (load-integer stream)))
@@ -296,20 +410,28 @@
                    (declare (ignore existing-value))
                    (when existing-value-p
                      (error "Duplicate backlink ID ~D." id)))
+                 (when *noisy-load*
+                   (format t "ADD-BACKLINK ~S~%" id))
                  (setf (gethash id omap) (vector-pop stack))))
-              (t (let ((value (multiple-value-list (load-one-object command stream stack))))
-                   (when value
-                     (vector-push-extend (first value) stack)))))))))
+              (t
+               (when *noisy-load*
+                 (format t "~S => " (llf-command-name command)))
+               (let ((value (multiple-value-list (load-one-object command stream stack))))
+                 (when *noisy-load*
+                   (format t "~S~%" value))
+                 (when value
+                   (vector-push-extend (first value) stack)))))))))
 
 (defun load-lisp-source (stream)
   (let ((*readtable* *readtable*)
         (*package* *package*)
-        (*load-truename* stream)
-        (*load-pathname* stream)
         (eof (cons nil nil)))
     (loop (let ((form (read stream nil eof)))
             (when (eql form eof) (return))
-            (when *load-print* (format t ";; Loading ~S~%" form))
+            (when *load-print*
+              (let ((*print-level* 3)
+                    (*print-length* 3))
+                (format t "~&~@<;; ~@;Loading ~S~:>~%" form)))
             (eval form)))
     t))
 
@@ -330,14 +452,16 @@
              (external-format :default)
              wired)
   (let ((*load-verbose* verbose)
-        (*load-print* print))
+        (*load-print* print)
+        ;; There is nothing in the spec about this, but I am sick of
+        ;; libraries fiddling with my optimize policy!
+        (mezzano.compiler::*optimize-policy* (copy-list mezzano.compiler::*optimize-policy*)))
     (cond ((streamp filespec)
            (let* ((*load-pathname* (ignore-errors (pathname filespec)))
-                  (*load-truename* (ignore-errors (pathname filespec))))
+                  (*load-truename* (ignore-errors (truename filespec))))
              (load-from-stream filespec wired)))
           (t (let* ((path (merge-pathnames filespec))
-                    (*load-pathname* (pathname path))
-                    (*load-truename* (pathname path)))
+                    (*load-pathname* (pathname path)))
                (with-open-file (stream filespec
                                        :if-does-not-exist (if if-does-not-exist
                                                               :error
@@ -349,7 +473,8 @@
                                                             :default
                                                             external-format))
                  (when stream
-                   (load-from-stream stream wired))))))))
+                   (let ((*load-truename* (truename stream)))
+                     (load-from-stream stream wired)))))))))
 
 (defun provide (module-name)
   (pushnew (string module-name) *modules*
@@ -364,7 +489,7 @@
             (dolist (pathname pathname-list)
               (load pathname))
             (load pathname-list))
-        (dolist (hook *require-hooks*
+        (dolist (hook *module-provider-functions*
                  (error "Unable to REQUIRE module ~A." module-name))
           (when (funcall hook module-name)
             (return)))))

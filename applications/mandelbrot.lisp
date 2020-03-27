@@ -1,108 +1,206 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(defpackage :mandelbrot
+(defpackage :mezzano.mandelbrot
   (:use :cl)
-  (:export #:spawn))
+  (:export #:spawn #:benchmark))
 
-(in-package :mandelbrot)
+(in-package :mezzano.mandelbrot)
 
 (defun hue-to-rgb (h)
-  (let* ((h* (/ (rem h 360.0) 60.0))
-         (x (- 1 (abs (- (mod h* 2) 1)))))
-    (cond
-      ((< h* 1) (values 1 x 0))
-      ((< h* 2) (values x 1 0))
-      ((< h* 3) (values 0 1 x))
-      ((< h* 4) (values 0 x 1))
-      ((< h* 5) (values x 0 1))
-      ((< h* 6) (values 1 0 x)))))
+  (declare (optimize (speed 3) (safety 0))
+           (type single-float h))
+  (let* ((h* h)
+         ;; Convert 1.0 to 0.0
+         (h^ (* (the single-float
+                     (if (>= h* 1.0f0)
+                         (- h* 1.0f0)
+                         h*))
+                6.0f0))
+         (index (truncate h^))
+         (f (- h^ (float index 0.0f0)))
+         (q (- 1.0f0 f)))
+    (declare (type single-float h* h^)
+             (type fixnum index))
+    (case index
+      (0 (values 1.0f0 f     0.0f0))
+      (1 (values q     1.0f0 0.0f0))
+      (2 (values 0.0f0 1.0f0 f))
+      (3 (values 0.0f0 q     1.0f0))
+      (4 (values f     0.0f0 1.0f0))
+      (5 (values 1.0f0 0.0f0 q)))))
 
-(defun m (cr ci iterations)
-  (let ((zr 0) (zi 0))
-    (dotimes (i iterations nil)
-      (let ((zr2 (* zr zr))
-            (zi2 (* zi zi)))
+(defun m (cr ci zr zi iterations)
+  (declare (optimize (speed 3) (safety 0))
+           (type single-float cr ci zr zi)
+           (type fixnum iterations))
+  (dotimes (i iterations nil)
+    (declare (type fixnum i))
+    (let ((zr2 (* zr zr))
+          (zi2 (* zi zi)))
+      (declare (type single-float zr2 zi2))
       (psetf zr (+ cr (- zr2 zi2))
              zi (+ ci (* zi zr) (* zr zi)))
-      (when (> (+ zr2 zi2) 4)
-        (return (* (/ i iterations) 360)))))))
+      (when (> (+ zr2 zi2) 4.0f0)
+        (return (/ (float i 0.0f0) (float iterations 0.0f0)))))))
 
-(defun render-mandelbrot (x y width height hue-offset)
+(defun render-mandelbrot (x y width height hue-offset julia)
   "Render one pixel."
-  (let* ((scale (/ 4 width))
-         (x^ (- x (/ width 2)))
-         (y^ (- y (/ height 2)))
-         (r 0) (g 0) (b 0))
+  (declare (optimize (speed 3) (safety 0))
+           (type single-float x y width height hue-offset))
+  (let* ((scale (/ 4.0f0 width))
+         (x^ (- x (/ width 2.0f0)))
+         (y^ (- y (/ height 2.0f0)))
+         (r 0.0f0) (g 0.0f0) (b 0.0f0))
+    (declare (type single-float scale x^ y^ r g b))
     (flet ((frag (x y)
-             (let ((hue (m (- (* scale x) 0.5)
-                           (* scale y)
-                           25)))
+             (declare (type single-float x y))
+             (let ((hue (if julia
+                            (m -0.4f0 0.6f0
+                               (* scale x) (* scale y)
+                               250)
+                            (m (- (* scale x) 0.5f0) (* scale y)
+                               0.0f0 0.0f0
+                               25))))
+               ;; Hue and hue-offset are both in [0,1]
                (when hue
-                 (multiple-value-bind (r* g* b*)
-                     (hue-to-rgb (+ hue-offset hue))
-                   (incf r r*)
-                   (incf g g*)
-                   (incf b b*))))))
-      (frag    x^         y^)
-      (frag (+ x^ 0.5)    y^)
-      (frag    x^      (+ y^ 0.5))
-      (frag (+ x^ 0.5) (+ y^ 0.5))
-      (mezzano.gui:make-colour (/ r 4) (/ g 4) (/ b 4)))))
+                 ;; Keep the final hue within the range [0,1]
+                 (let ((final-hue (+ (the single-float hue) hue-offset)))
+                   (declare (type single-float final-hue))
+                   (when (>= final-hue 1.0f0)
+                     (decf final-hue 1.0f0))
+                   (multiple-value-bind (r* g* b*)
+                       (hue-to-rgb final-hue)
+                     (declare (type single-float r* g* b*))
+                     (incf r r*)
+                     (incf g g*)
+                     (incf b b*)))))))
+      (frag    x^           y^)
+      (frag (+ x^ 0.5f0)    y^)
+      (frag    x^        (+ y^ 0.5f0))
+      (frag (+ x^ 0.5f0) (+ y^ 0.5f0))
+      (mezzano.gui:make-colour (/ r 4.0f0) (/ g 4.0f0) (/ b 4.0f0)))))
 
-(defgeneric dispatch-event (frame event)
+(defclass mandelbrot ()
+  ((%frame :initarg :frame :accessor frame)
+   (%window :initarg :window :accessor window)
+   (%fifo :initarg :fifo :accessor fifo)
+   (%juliap :initarg :juliap :accessor juliap)))
+
+(defgeneric dispatch-event (app event)
   (:method (f e)))
 
-(defmethod dispatch-event (frame (event mezzano.gui.compositor:window-activation-event))
-  (setf (mezzano.gui.widgets:activep frame) (mezzano.gui.compositor:state event))
-  (mezzano.gui.widgets:draw-frame frame))
+(defmethod dispatch-event (app (event mezzano.gui.compositor:window-activation-event))
+  (setf (mezzano.gui.widgets:activep (frame app)) (mezzano.gui.compositor:state event))
+  (mezzano.gui.widgets:draw-frame (frame app)))
 
-(defmethod dispatch-event (frame (event mezzano.gui.compositor:mouse-event))
+(defmethod dispatch-event (app (event mezzano.gui.compositor:mouse-event))
   (handler-case
-      (mezzano.gui.widgets:frame-mouse-event frame event)
+      (mezzano.gui.widgets:frame-mouse-event (frame app) event)
     (mezzano.gui.widgets:close-button-clicked ()
       (throw 'quit nil))))
 
-(defmethod dispatch-event (frame (event mezzano.gui.compositor:window-close-event))
+(defmethod dispatch-event (app (event mezzano.gui.compositor:window-close-event))
   (throw 'quit nil))
 
-(defun mandelbrot-main ()
+(defmethod dispatch-event (app (event mezzano.gui.compositor:quit-event))
+  (throw 'quit nil))
+
+(define-condition must-redraw () ())
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-request-event))
+  (let ((old-width (mezzano.gui.compositor:width (window app)))
+        (old-height (mezzano.gui.compositor:height (window app)))
+        (new-width (max 100 (mezzano.gui.compositor:width event)))
+        (new-height (max 100 (mezzano.gui.compositor:height event))))
+    (when (or (not (eql old-width new-width))
+              (not (eql old-height new-height)))
+      (let ((new-framebuffer (mezzano.gui:make-surface
+                              new-width new-height)))
+        (mezzano.gui.widgets:resize-frame (frame app) new-framebuffer)
+        (mezzano.gui.compositor:resize-window
+         (window app) new-framebuffer
+         :origin (mezzano.gui.compositor:resize-origin event))))))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-event))
+  (signal 'must-redraw))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:key-event))
+  (when (mezzano.gui.compositor:key-releasep event)
+    (case (mezzano.gui.compositor:key-key event)
+      ((#\j #\J)
+       (setf (juliap app) t))
+      ((#\m #\M)
+       (setf (juliap app) nil)))
+    (signal 'must-redraw)))
+
+(defun benchmark (&key (width 500) (height width) julia (hue (get-universal-time)))
+  (let ((framebuffer (mezzano.gui:make-surface width height))
+        (hue-offset (/ (rem hue 360) 360.0)))
+    (dotimes (y height)
+      (dotimes (x width)
+        (setf (mezzano.gui:surface-pixel framebuffer x y)
+              (render-mandelbrot (float x 0.0f0) (float y 0.0f0)
+                                 (float width 0.0f0) (float height 0.0f0)
+                                 hue-offset
+                                 julia))))
+    framebuffer))
+
+(defun mandelbrot-main (width height)
   (with-simple-restart (abort "Close Mandelbrot")
     (catch 'quit
       (let ((fifo (mezzano.supervisor:make-fifo 50)))
-        (mezzano.gui.compositor:with-window (window fifo 500 500)
-          (let* ((framebuffer (mezzano.gui.compositor:window-buffer window))
-                 (frame (make-instance 'mezzano.gui.widgets:frame
-                                       :framebuffer framebuffer
+        (mezzano.gui.compositor:with-window (window fifo width height)
+          (let* ((frame (make-instance 'mezzano.gui.widgets:frame
+                                       :framebuffer (mezzano.gui.compositor:window-buffer window)
                                        :title "Mandelbrot"
                                        :close-button-p t
-                                       :damage-function (mezzano.gui.widgets:default-damage-function window))))
-            (mezzano.gui.widgets:draw-frame frame)
+                                       :resizablep t
+                                       :damage-function (mezzano.gui.widgets:default-damage-function window)
+                                       :set-cursor-function (mezzano.gui.widgets:default-cursor-function window)))
+                 (app (make-instance 'mandelbrot
+                                     :fifo fifo
+                                     :window window
+                                     :frame frame
+                                     :juliap nil)))
+            (mezzano.gui.widgets:draw-frame (frame app))
             (mezzano.gui.compositor:damage-window window
                                                   0 0
                                                   (mezzano.gui.compositor:width window)
                                                   (mezzano.gui.compositor:height window))
-            (multiple-value-bind (left right top bottom)
-                (mezzano.gui.widgets:frame-size frame)
-              (let ((width (- (mezzano.gui.compositor:width window) left right))
-                    (height (- (mezzano.gui.compositor:width window) top bottom))
-                    (pixel-count 0)
-                    (hue-offset (rem (get-universal-time) 360)))
-                ;; Render a line at a time, should do this in a seperate thread really...
-                ;; More than one thread, even.
-                (dotimes (y height)
-                  (dotimes (x width)
-                    (setf (mezzano.gui:surface-pixel framebuffer (+ left x) (+ top y)) (render-mandelbrot x y width height hue-offset)))
-                  (mezzano.gui.compositor:damage-window window left (+ top y) width 1)
-                  (loop
-                     (let ((evt (mezzano.supervisor:fifo-pop fifo nil)))
-                       (when (not evt) (return))
-                       (dispatch-event frame evt)))))
-              (loop
-                 (dispatch-event frame (mezzano.supervisor:fifo-pop fifo))))))))))
+            (tagbody
+             REDRAW
+               (multiple-value-bind (left right top bottom)
+                   (mezzano.gui.widgets:frame-size (frame app))
+                 (let ((framebuffer (mezzano.gui.compositor:window-buffer window))
+                       (width (- (mezzano.gui.compositor:width window) left right))
+                       (height (- (mezzano.gui.compositor:height window) top bottom))
+                       (hue-offset (/ (rem (get-universal-time) 360) 360.0)))
+                   ;; Render a line at a time, should do this in a seperate thread really...
+                   ;; More than one thread, even.
+                   (dotimes (y height)
+                     (dotimes (x width)
+                       (setf (mezzano.gui:surface-pixel framebuffer (+ left x) (+ top y))
+                             (render-mandelbrot (float x) (float y)
+                                                (float width) (float height)
+                                                hue-offset
+                                                (juliap app))))
+                     (mezzano.gui.compositor:damage-window window left (+ top y) width 1)
+                     (loop
+                        (let ((evt (mezzano.supervisor:fifo-pop fifo nil)))
+                          (when (not evt) (return))
+                          (handler-case
+                              (dispatch-event app evt)
+                            (must-redraw ()
+                              (go REDRAW))))))))
+               (loop
+                  (handler-case
+                      (dispatch-event app (mezzano.supervisor:fifo-pop fifo))
+                    (must-redraw ()
+                      (go REDRAW)))))))))))
 
-(defun spawn ()
-  (mezzano.supervisor:make-thread 'mandelbrot-main
+(defun spawn (&optional (width 500) (height width))
+  (mezzano.supervisor:make-thread (lambda () (mandelbrot-main width height))
                                   :name "Mandelbrot"
                                   :initial-bindings `((*terminal-io* ,(make-instance 'mezzano.gui.popup-io-stream:popup-io-stream
                                                                                      :title "Mandelbrot console"))

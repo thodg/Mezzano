@@ -3,13 +3,15 @@
 
 (defpackage :mezzano.gui.popup-io-stream
   (:use :cl :mezzano.gui.font)
-  (:export #:popup-io-stream))
+  (:local-nicknames (:sys.int :mezzano.internals))
+  (:export #:popup-io-stream
+           #:lazy-popup-io-stream))
 
 (in-package :mezzano.gui.popup-io-stream)
 
 (defclass popup-io-stream (mezzano.line-editor:line-edit-mixin
-                           sys.gray:fundamental-character-input-stream
-                           sys.gray:fundamental-character-output-stream)
+                           mezzano.gray:fundamental-character-input-stream
+                           mezzano.gray:fundamental-character-output-stream)
   ((%fifo :reader fifo)
    (%framebuffer :reader framebuffer)
    (%closed :accessor window-closed)
@@ -34,7 +36,7 @@
    (%width :initarg :width :reader width)
    (%height :initarg :height :reader height)))
 
-(defmethod initialize-instance :after ((instance popup-io-stream) &key (width 640) (height 480) title &allow-other-keys)
+(defmethod initialize-instance :after ((instance popup-io-stream) &key (width 640) (height 480) title)
   ;; Do this early so the initial text-widget damage even won't open the window.
   (setf (window-closed instance) nil
         (slot-value instance '%fifo) (mezzano.supervisor:make-fifo 50)
@@ -132,36 +134,37 @@
 
 
 (defun window-thread (stream)
-  (mezzano.gui.compositor:with-window (window (fifo stream) (mezzano.gui:surface-width (framebuffer stream)) (mezzano.gui:surface-height (framebuffer stream))
-                                              :initial-z-order :below-current)
-    (setf (slot-value stream '%window) window
-          (mezzano.gui.widgets:activep (frame stream)) nil)
-    (mezzano.gui.widgets:draw-frame (frame stream))
-    (dispatch-event stream
-                    (make-instance 'damage
-                                   :x 0
-                                   :y 0
-                                   :width (mezzano.gui.compositor:width window)
-                                   :height (mezzano.gui.compositor:height window)))
-    (unwind-protect
-         (loop
-            (handler-case
-                (dispatch-event stream (mezzano.supervisor:fifo-pop (fifo stream)))
-              (mezzano.gui.widgets:close-button-clicked ()
-                (mezzano.supervisor:with-mutex ((lock stream))
-                  (when (zerop (waiting-input-count stream))
-                    (setf (slot-value stream '%window) nil
-                          (slot-value stream '%thread) nil
-                          (window-closed stream) t)
-                    (return))))
-              (error (c)
-                (ignore-errors
-                  (format t "~&Error ~A in popup stream.~%" c)))))
-      (mezzano.supervisor:with-mutex ((lock stream))
-        (when (eql (slot-value stream '%window) window)
-          (setf (slot-value stream '%window) nil
-                (slot-value stream '%thread) nil
-                (window-closed stream) t))))))
+  (let ((*terminal-io* sys.int::*cold-stream*))
+    (mezzano.gui.compositor:with-window (window (fifo stream) (mezzano.gui:surface-width (framebuffer stream)) (mezzano.gui:surface-height (framebuffer stream))
+                                                :initial-z-order :below-current)
+      (setf (slot-value stream '%window) window
+            (mezzano.gui.widgets:activep (frame stream)) nil)
+      (mezzano.gui.widgets:draw-frame (frame stream))
+      (dispatch-event stream
+                      (make-instance 'damage
+                                     :x 0
+                                     :y 0
+                                     :width (mezzano.gui.compositor:width window)
+                                     :height (mezzano.gui.compositor:height window)))
+      (unwind-protect
+           (loop
+              (handler-case
+                  (dispatch-event stream (mezzano.supervisor:fifo-pop (fifo stream)))
+                (mezzano.gui.widgets:close-button-clicked ()
+                  (mezzano.supervisor:with-mutex ((lock stream))
+                    (when (zerop (waiting-input-count stream))
+                      (setf (slot-value stream '%window) nil
+                            (slot-value stream '%thread) nil
+                            (window-closed stream) t)
+                      (return))))
+                (error (c)
+                  (ignore-errors
+                    (format t "~&Error ~A in popup stream.~%" c)))))
+        (mezzano.supervisor:with-mutex ((lock stream))
+          (when (eql (slot-value stream '%window) window)
+            (setf (slot-value stream '%window) nil
+                  (slot-value stream '%thread) nil
+                  (window-closed stream) t)))))))
 
 (defun open-window (stream)
   (when (window-closed stream)
@@ -183,7 +186,7 @@
     (setf (break-requested stream) nil)
     (break)))
 
-(defmethod sys.gray:stream-read-char ((stream popup-io-stream))
+(defmethod mezzano.gray:stream-read-char ((stream popup-io-stream))
   (loop
      (check-for-break stream)
      (unwind-protect
@@ -202,7 +205,7 @@
               (decf (waiting-input-count stream))))
        (setf (mezzano.gui.widgets:cursor-visible (display stream)) nil))))
 
-(defmethod sys.gray:stream-read-char-no-hang ((stream popup-io-stream))
+(defmethod mezzano.gray:stream-read-char-no-hang ((stream popup-io-stream))
   (check-for-break stream)
   (mezzano.supervisor:with-mutex ((lock stream))
     ;; Examine input stream.
@@ -210,25 +213,25 @@
 
 ;;; Forward stream stuff on to the display.
 
-(defmethod sys.gray:stream-terpri ((stream popup-io-stream))
+(defmethod mezzano.gray:stream-terpri ((stream popup-io-stream))
   (check-for-break stream)
   (mezzano.supervisor:with-mutex ((lock stream))
-    (sys.gray:stream-terpri (display stream))))
+    (mezzano.gray:stream-terpri (display stream))))
 
-(defmethod sys.gray:stream-write-char ((stream popup-io-stream) character)
+(defmethod mezzano.gray:stream-write-char ((stream popup-io-stream) character)
   (check-for-break stream)
   (mezzano.supervisor:with-mutex ((lock stream))
-    (sys.gray:stream-write-char (display stream) character)))
+    (mezzano.gray:stream-write-char (display stream) character)))
 
-(defmethod sys.gray:stream-start-line-p ((stream popup-io-stream))
+(defmethod mezzano.gray:stream-start-line-p ((stream popup-io-stream))
   (check-for-break stream)
   (mezzano.supervisor:with-mutex ((lock stream))
-    (sys.gray:stream-start-line-p (display stream))))
+    (mezzano.gray:stream-start-line-p (display stream))))
 
-(defmethod sys.gray:stream-line-column ((stream popup-io-stream))
+(defmethod mezzano.gray:stream-line-column ((stream popup-io-stream))
   (check-for-break stream)
   (mezzano.supervisor:with-mutex ((lock stream))
-    (sys.gray:stream-line-column (display stream))))
+    (mezzano.gray:stream-line-column (display stream))))
 
 (defmethod sys.int::stream-cursor-pos ((stream popup-io-stream))
   (check-for-break stream)
@@ -254,3 +257,56 @@
   (check-for-break stream)
   (mezzano.supervisor:with-mutex ((lock stream))
     (sys.int::stream-clear-between (display stream) start-x start-y end-x end-y)))
+
+(defvar *instances* (make-hash-table :weakness :key))
+(defvar *instances-lock* (mezzano.supervisor:make-mutex "Popup instances lock"))
+
+(defclass lazy-popup-io-stream (mezzano.gray:fundamental-character-input-stream
+                                mezzano.gray:fundamental-character-output-stream)
+  ())
+
+(defun get-thread-popup-io-stream ()
+  (mezzano.supervisor:with-mutex (*instances-lock*)
+    (let* ((thread (mezzano.supervisor:current-thread))
+           (entry (gethash thread *instances*)))
+      (when (not entry)
+        (setf entry (make-instance 'popup-io-stream
+                                   :title (format nil "Console for ~S" thread))
+              (gethash thread *instances*) entry))
+      entry)))
+
+(defmethod mezzano.gray:stream-read-char ((stream lazy-popup-io-stream))
+  (mezzano.gray:stream-read-char (get-thread-popup-io-stream)))
+
+(defmethod mezzano.gray:stream-read-char-no-hang ((stream lazy-popup-io-stream))
+  (mezzano.gray:stream-read-char-no-hang (get-thread-popup-io-stream)))
+
+(defmethod mezzano.gray:stream-unread-char ((stream lazy-popup-io-stream) character)
+  (mezzano.gray:stream-unread-char (get-thread-popup-io-stream) character))
+
+(defmethod mezzano.gray:stream-terpri ((stream lazy-popup-io-stream))
+  (mezzano.gray:stream-terpri (get-thread-popup-io-stream)))
+
+(defmethod mezzano.gray:stream-write-char ((stream lazy-popup-io-stream) character)
+  (mezzano.gray:stream-write-char (get-thread-popup-io-stream) character))
+
+(defmethod mezzano.gray:stream-start-line-p ((stream lazy-popup-io-stream))
+  (mezzano.gray:stream-start-line-p (get-thread-popup-io-stream)))
+
+(defmethod mezzano.gray:stream-line-column ((stream lazy-popup-io-stream))
+  (mezzano.gray:stream-line-column (get-thread-popup-io-stream)))
+
+(defmethod sys.int::stream-cursor-pos ((stream lazy-popup-io-stream))
+  (sys.int::stream-cursor-pos (get-thread-popup-io-stream)))
+
+(defmethod sys.int::stream-move-to ((stream lazy-popup-io-stream) x y)
+  (sys.int::stream-move-to (get-thread-popup-io-stream) x y))
+
+(defmethod sys.int::stream-character-width ((stream lazy-popup-io-stream) character)
+  (sys.int::stream-character-width (get-thread-popup-io-stream) character))
+
+(defmethod sys.int::stream-compute-motion ((stream lazy-popup-io-stream) string &optional (start 0) end initial-x initial-y)
+  (sys.int::stream-compute-motion (get-thread-popup-io-stream) string start end initial-x initial-y))
+
+(defmethod sys.int::stream-clear-between ((stream lazy-popup-io-stream) start-x start-y end-x end-y)
+  (sys.int::stream-clear-between (get-thread-popup-io-stream) start-x start-y end-x end-y))

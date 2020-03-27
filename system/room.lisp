@@ -1,7 +1,7 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
 (defparameter *object-tags-to-basic-types*
   #(array-t                    ; #b000000
@@ -28,7 +28,7 @@
     array-complex-double-float ; #b010101
     array-complex-short-float  ; #b010110
     array-complex-long-float   ; #b010111
-    array-xmm-vector           ; #b011000
+    invalid-011000             ; #b011000
     invalid-011001             ; #b011001
     invalid-011010             ; #b011010
     invalid-011011             ; #b011011
@@ -37,36 +37,36 @@
     simple-array               ; #b011110
     array                      ; #b011111
     bignum                     ; #b100000
-    double-float               ; #b100001
-    short-float                ; #b100010
-    long-float                 ; #b100011
-    complex-rational           ; #b100100
-    complex-single-float       ; #b100101
-    complex-double-float       ; #b100110
-    complex-short-float        ; #b100111
-    complex-long-float         ; #b101000
-    ratio                      ; #b101001
+    ratio                      ; #b100001
+    double-float               ; #b100010
+    short-float                ; #b100011
+    long-float                 ; #b100100
+    complex-rational           ; #b100101
+    complex-single-float       ; #b100110
+    complex-double-float       ; #b100111
+    complex-short-float        ; #b101000
+    complex-long-float         ; #b101001
     invalid-101010             ; #b101010
     invalid-101011             ; #b101011
     invalid-101100             ; #b101100
     invalid-101101             ; #b101101
-    invalid-101110             ; #b101110
-    invalid-101111             ; #b101111
+    mezzano.runtime::symbol-value-cell ; #b101110
+    mezzano.simd:mmx-vector    ; #b101111
     symbol                     ; #b110000
-    structure-object           ; #b110001
-    std-instance               ; #b110010
-    xmm-vector                 ; #b110011
-    thread                     ; #b110100
-    unbound-value              ; #b110101
+    invalid-110001             ; #b110001
+    invalid-110010             ; #b110010
+    mezzano.simd:sse-vector    ; #b110011
+    invalid-110100             ; #b110100
+    instance                   ; #b110101
     function-reference         ; #b110110
     interrupt-frame            ; #b110111
     cons                       ; #b111000
     freelist-entry             ; #b111001
     weak-pointer               ; #b111010
-    invalid-111011             ; #b111011
+    mezzano.delimited-continuations:delimited-continuation ; #b111011
     function                   ; #b111100
-    closure                    ; #b111101
-    funcallable-instance       ; #b111110
+    funcallable-instance       ; #b111101
+    closure                    ; #b111110
     invalid-111111             ; #b111111
     )
   "Mapping from object tags to more friendly names.
@@ -79,68 +79,108 @@ Should be kept in sync with data-types.")
               (aref *object-tags-to-basic-types* i)
               (aref n-allocated-objects i)
               (aref allocated-object-sizes i))))
-  (loop for i below (length allocated-classes) by 2 do
-       (let ((class (aref allocated-classes i))
-             (count (aref allocated-classes (1+ i))))
-         (format t "  ~A: ~:D objects.~%" class count))))
+  (let ((classes-and-counts
+         (sort (loop
+                  for i below (length allocated-classes) by 2
+                  collect (cons (aref allocated-classes i)
+                                (aref allocated-classes (1+ i))))
+               #'>
+               :key #'cdr)))
+    (loop
+       for (class . count) in classes-and-counts
+       do (format t "  ~A: ~:D objects. ~:D words.~%"
+                  class count
+                  (* count (1+ (layout-heap-size
+                                (mezzano.clos:class-layout class))))))))
+
+(defun room-pinned-area (area verbosity)
+  (multiple-value-bind (allocated-words total-words largest-free-space n-allocated-objects allocated-object-sizes allocated-classes)
+      (area-info area)
+    (format t "~:(~A~) area: ~:D/~:D words allocated (~D%).~%"
+            area
+            allocated-words total-words
+            (truncate (* allocated-words 100) total-words))
+    (format t "  Largest free area: ~:D words.~%" largest-free-space)
+    (when (eql verbosity t)
+      (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)
+      (print-fragment-counts (pinned-area-fragment-counts area)))
+    (values allocated-words total-words)))
 
 (defun room (&optional (verbosity :default))
   (let ((total-used 0)
         (total 0))
-    (format t "General area: ~:D/~:D words used (~D%).~%"
-            (truncate *general-area-bump* 8) (truncate *general-area-limit* 8)
-            (truncate (* *general-area-bump* 100) *general-area-limit*))
-    (incf total-used (truncate *general-area-bump* 8))
-    (incf total (truncate *general-area-limit* 8))
+    (let ((general-bump (+ *general-area-old-gen-bump* *general-area-young-gen-bump*))
+          (general-limit (+ *general-area-old-gen-limit* *general-area-young-gen-limit*)))
+      (format t "General area: ~:D/~:D words used (~D%).~%"
+              (truncate general-bump 8) (truncate general-limit 8)
+              (truncate (* general-bump 100) general-limit))
+      (incf total-used (truncate general-bump 8))
+      (incf total (truncate general-limit 8)))
     (when (eql verbosity t)
+      (format t "  General area old gen: ~:D/~:D words used (~D%).~%"
+              (truncate *general-area-old-gen-bump* 8) (truncate *general-area-old-gen-limit* 8)
+              (truncate (* *general-area-old-gen-bump* 100) *general-area-old-gen-limit*))
+      (format t "  General area young gen: ~:D/~:D words used (~D%).~%"
+              (truncate *general-area-young-gen-bump* 8) (truncate *general-area-young-gen-limit* 8)
+              (truncate (* *general-area-young-gen-bump* 100) (max 1 *general-area-young-gen-limit*)))
       (multiple-value-bind (allocated-words total-words largest-free-space n-allocated-objects allocated-object-sizes allocated-classes)
           (area-info :general)
         (declare (ignore allocated-words total-words largest-free-space))
         (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)))
-    (format t "Cons area: ~:D/~:D words used (~D%).~%"
-            (truncate *cons-area-bump* 8) (truncate *cons-area-limit* 8)
-            (truncate (* *cons-area-bump* 100) *cons-area-limit*))
-    (incf total-used (truncate *cons-area-bump* 8))
-    (incf total (truncate *cons-area-limit* 8))
+    (let ((cons-bump (+ *cons-area-old-gen-bump* *cons-area-young-gen-bump*))
+          (cons-limit (+ *cons-area-old-gen-limit* *cons-area-young-gen-limit*)))
+      (format t "Cons area: ~:D/~:D words used (~D%).~%"
+              (truncate cons-bump 8) (truncate cons-limit 8)
+              (truncate (* cons-bump 100) cons-limit))
+      (incf total-used (truncate cons-bump 8))
+      (incf total (truncate cons-limit 8)))
     (when (eql verbosity t)
+      (format t "  Cons area old gen: ~:D/~:D words used (~D%).~%"
+              (truncate *cons-area-old-gen-bump* 8) (truncate *cons-area-old-gen-limit* 8)
+              (truncate (* *cons-area-old-gen-bump* 100) *cons-area-old-gen-limit*))
+      (format t "  Cons area young gen: ~:D/~:D words used (~D%).~%"
+              (truncate *cons-area-young-gen-bump* 8) (truncate *cons-area-young-gen-limit* 8)
+              (truncate (* *cons-area-young-gen-bump* 100) (max 1 *cons-area-young-gen-limit*)))
       (multiple-value-bind (allocated-words total-words largest-free-space n-allocated-objects allocated-object-sizes allocated-classes)
           (area-info :cons)
         (declare (ignore allocated-words total-words largest-free-space))
         (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)))
-    (multiple-value-bind (allocated-words total-words largest-free-space n-allocated-objects allocated-object-sizes allocated-classes)
-        (area-info :wired)
-      (format t "Wired area: ~:D/~:D words allocated (~D%).~%"
-              allocated-words total-words
-              (truncate (* allocated-words 100) total-words))
-      (format t "  Largest free area: ~:D words.~%" largest-free-space)
+    (multiple-value-bind (allocated-words total-words)
+        (room-pinned-area :wired verbosity)
       (incf total-used allocated-words)
-      (incf total total-words)
-      (when (eql verbosity t)
-        (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)))
-    (multiple-value-bind (allocated-words total-words largest-free-space n-allocated-objects allocated-object-sizes allocated-classes)
-        (area-info :pinned)
-      (format t "Pinned area: ~:D/~:D words allocated (~D%).~%"
-              allocated-words total-words
-              (truncate (* allocated-words 100) total-words))
-      (format t "  Largest free area: ~:D words.~%" largest-free-space)
+      (incf total total-words))
+    (multiple-value-bind (allocated-words total-words)
+        (room-pinned-area :wired-function verbosity)
       (incf total-used allocated-words)
-      (incf total total-words)
-      (when (eql verbosity t)
-        (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)))
+      (incf total total-words))
+    (multiple-value-bind (allocated-words total-words)
+        (room-pinned-area :function verbosity)
+      (incf total-used allocated-words)
+      (incf total total-words))
+    (multiple-value-bind (allocated-words total-words)
+        (room-pinned-area :pinned verbosity)
+      (incf total-used allocated-words)
+      (incf total total-words))
     (format t "Total ~:D/~:D words used (~D%).~%"
             total-used total
             (truncate (* total-used 100) total))
-    (multiple-value-bind (n-free-blocks total-blocks)
-        (mezzano.supervisor:store-statistics)
-      (format t "~:D/~:D store blocks used (~D%).~%"
-              (- total-blocks n-free-blocks) total-blocks
-              (truncate (* (- total-blocks n-free-blocks) 100) total-blocks)))
+    (when (not (eql mezzano.supervisor::*paging-disk* :freestanding))
+      (multiple-value-bind (n-free-blocks total-blocks)
+          (mezzano.supervisor:store-statistics)
+        (format t "~:D/~:D store blocks used (~D%).~%"
+                (- total-blocks n-free-blocks) total-blocks
+                (truncate (* (- total-blocks n-free-blocks) 100) total-blocks))))
     (multiple-value-bind (n-free-page-frames total-page-frames)
         (mezzano.supervisor:physical-memory-statistics)
       (format t "~:D/~:D physical pages used (~D%).~%"
               (- total-page-frames n-free-page-frames) total-page-frames
               (truncate (* (- total-page-frames n-free-page-frames) 100)
                         total-page-frames))))
+  (when (eql verbosity t)
+    (format t "Paging disk is ~S.~%" mezzano.supervisor::*paging-disk*)
+    (format t "Fudge-factor is ~D.~%" mezzano.supervisor::*store-fudge-factor*)
+    (when mezzano.supervisor::*paging-read-only*
+      (format t "Running in read-only mode.~%")))
   (values))
 
 (defun %walk-pinned-area (base limit fn)
@@ -160,14 +200,12 @@ Should be kept in sync with data-types.")
                   size)
          (incf address (* size 8))))))
 
-(defun %walk-general-area (fn)
+(defun %walk-general-area-1 (fn base length)
   (let ((finger 0))
     (loop
-       (when (eql finger *general-area-bump*)
+       (when (eql finger length)
          (return))
-       (let* ((address (logior finger
-                               (ash +address-tag-general+ +address-tag-shift+)
-                               *dynamic-mark-bit*))
+       (let* ((address (logior base finger))
               (object (%%assemble-value address +tag-object+))
               (size (object-size object)))
          (funcall fn object address size)
@@ -175,26 +213,58 @@ Should be kept in sync with data-types.")
            (incf size))
          (incf finger (* size 8))))))
 
-(defun %walk-cons-area (fn)
+(defun %walk-general-area (fn)
+  ;; Young gen.
+  (%walk-general-area-1 fn
+                        (logior (ash +address-tag-general+ +address-tag-shift+)
+                                *young-gen-newspace-bit*)
+                        *general-area-young-gen-bump*)
+  ;; Old gen.
+  (%walk-general-area-1 fn
+                        (logior (ash +address-tag-general+ +address-tag-shift+)
+                                +address-old-generation+
+                                *old-gen-newspace-bit*)
+                        *general-area-old-gen-bump*))
+
+(defun %walk-cons-area-1 (fn base length)
   (let ((finger 0))
     (loop
-       (when (eql finger *cons-area-bump*)
+       (when (eql finger length)
          (return))
-       (let* ((address (logior finger
-                               (ash +address-tag-cons+ +address-tag-shift+)
-                               *dynamic-mark-bit*))
+       (let* ((address (logior base finger))
               (object (%%assemble-value address +tag-cons+)))
          (funcall fn object address 2)
          (incf finger 16)))))
 
+(defun %walk-cons-area (fn)
+  ;; Young gen.
+  (%walk-cons-area-1 fn
+                     (logior (ash +address-tag-cons+ +address-tag-shift+)
+                             *young-gen-newspace-bit*)
+                     *cons-area-young-gen-bump*)
+  ;; Old gen.
+  (%walk-cons-area-1 fn
+                     (logior (ash +address-tag-cons+ +address-tag-shift+)
+                             +address-old-generation+
+                             *old-gen-newspace-bit*)
+                     *cons-area-old-gen-bump*))
+
+(defparameter *area-names* '(:pinned :wired :wired-function :function :general :cons))
+
+(defun walk-all-areas (fn)
+  (dolist (area *area-names*)
+    (walk-area area fn)))
+
 (defun walk-area (area fn)
   "Call FN with the value, address and size of every object in AREA.
 FN will be called with the world stopped, it must not allocate."
-  (check-type area (member :pinned :wired :general :cons))
+  (check-type area (member :pinned :wired :wired-function :function :general :cons))
   (mezzano.supervisor:with-world-stopped ()
     (case area
-      (:pinned (%walk-pinned-area (* 2 1024 1024 1024) *pinned-area-bump* fn))
-      (:wired (%walk-pinned-area (* 2 1024 1024) *wired-area-bump* fn))
+      (:pinned (%walk-pinned-area *pinned-area-base* *pinned-area-bump* fn))
+      (:wired (%walk-pinned-area *wired-area-base* *wired-area-bump* fn))
+      (:wired-function (%walk-pinned-area *wired-function-area-limit* *function-area-base* fn))
+      (:function (%walk-pinned-area *function-area-base* *function-area-limit* fn))
       (:general (%walk-general-area fn))
       (:cons (%walk-cons-area fn)))))
 
@@ -222,6 +292,7 @@ FN will be called with the world stopped, it must not allocate."
                   (vector-push 1 allocated-classes))))
       (walk-area area
                  (lambda (object address size)
+                   (declare (ignore address))
                    (let ((tag (if (consp object)
                                   +object-tag-cons+
                                   (%object-tag object))))
@@ -233,11 +304,107 @@ FN will be called with the world stopped, it must not allocate."
                      (case tag
                        (#.+object-tag-freelist-entry+
                         (setf largest-free-space (max largest-free-space size)))
-                       (#.+object-tag-std-instance+
-                        (add-class (std-instance-class object)))
-                       (#.+object-tag-funcallable-instance+
-                        (add-class (funcallable-std-instance-class object)))
-                       (#.+object-tag-structure-object+
-                        (add-class (%struct-slot object 0))))))))
+                       ((#.+object-tag-instance+
+                         #.+object-tag-funcallable-instance+)
+                        (let ((layout (%instance-layout object)))
+                          (add-class
+                           (layout-class
+                            (if (layout-p layout)
+                                layout
+                                (mezzano.runtime::obsolete-instance-layout-old-layout layout)))))))))))
     (values allocated-words total-words largest-free-space
             n-allocated-objects allocated-objects-sizes allocated-classes)))
+
+(defun print-fragment-counts (counts)
+  (format t "  Free fragment counts:~%")
+  (dotimes (i (length counts))
+    (let ((n (aref counts i)))
+      (when (not (zerop n))
+        (format t "    ~:D words:~35T~D~%" (ash 1 i) n)))))
+
+(defun pinned-area-fragment-counts (area)
+  (let ((counts (make-array 64 :initial-element 0)))
+    (walk-area area
+               (lambda (object address size)
+                 (declare (ignore address))
+                 (when (%object-of-type-p object +object-tag-freelist-entry+)
+                   (incf (aref counts (integer-length (1- size)))))))
+    counts))
+
+(defun walk-object-references (object fn)
+  "Walk an object and call FN with the object, the value of any unspecialized field, and the field index.
+An unspecialized field is a field that may hold any Lisp value, not specialized
+on floats or integers."
+  (cond ((consp object)
+         (funcall fn object (car object) :car)
+         (funcall fn object (cdr object) :cdr))
+        ((%value-has-tag-p object +tag-object+)
+         (case (%object-tag object)
+           (#.+object-tag-array-t+
+            (dotimes (i (length object))
+              (funcall fn object (svref object i) i)))
+           ((#.+object-tag-simple-string+
+             #.+object-tag-string+
+             #.+object-tag-simple-array+
+             #.+object-tag-array+)
+            ;; Don't include the axes, they're not references.
+            (funcall fn object (%complex-array-storage object) +complex-array-storage+)
+            (funcall fn object (%complex-array-fill-pointer object) +complex-array-fill-pointer+)
+            (funcall fn object (%complex-array-info object) +complex-array-info+))
+           (#.+object-tag-ratio+
+            (funcall fn object (numerator object) +ratio-numerator+)
+            (funcall fn object (denominator object) +ratio-denominator+))
+           (#.+object-tag-complex-rational+
+            (funcall fn object (realpart object) +complex-realpart+)
+            (funcall fn object (imagpart object) +complex-imagpart+))
+           (#.+object-tag-symbol-value-cell+
+            (dotimes (i (%object-header-data object))
+              (funcall fn object (%object-ref-t object i) i)))
+           (#.+object-tag-symbol+
+            (dotimes (i 5)
+              (funcall fn object (%object-ref-t object i) i)))
+           (#.+object-tag-instance+
+            ;; Gets a bit hairy with gc link-snapping...
+            (let* ((direct-layout (%instance-layout object))
+                   (layout (if (layout-p direct-layout)
+                               direct-layout
+                               (mezzano.runtime::obsolete-instance-layout-old-layout
+                                direct-layout)))
+                   (heap-layout (layout-heap-layout layout)))
+              (funcall fn object layout -1)
+              (cond ((eql heap-layout 't)
+                     (dotimes (i (layout-heap-size layout))
+                       (funcall fn object (%object-ref-t object i) i)))
+                    (heap-layout
+                     (dotimes (i (layout-heap-size layout))
+                       (when (eql (bit heap-layout i) 1)
+                         (funcall fn object (%object-ref-t object i) i)))))))
+           (#.+object-tag-function-reference+
+            (funcall fn object (%object-ref-t object +fref-name+) +fref-name+)
+            (funcall fn object (%object-ref-t object +fref-function+) +fref-function+))
+           ;;+object-tag-weak-pointer+
+           (#.+object-tag-function+
+            (let ((pool-base (function-pool-base object)))
+              (dotimes (i (function-pool-size object))
+                (funcall fn object (%object-ref-t object (+ pool-base i)) (+ pool-base i)))))
+           (#.+object-tag-funcallable-instance+
+            ;; Gets a bit hairy with gc link-snapping...
+            (let* ((direct-layout (%instance-layout object))
+                   (layout (if (layout-p direct-layout)
+                               direct-layout
+                               (mezzano.runtime::obsolete-instance-layout-old-layout
+                                direct-layout)))
+                   (heap-layout (layout-heap-layout layout)))
+              (funcall fn object layout -1)
+              (funcall fn object (%object-ref-t fn +funcallable-instance-function+) +funcallable-instance-function+)
+              (cond ((eql heap-layout 't)
+                     (dotimes (i (layout-heap-size layout))
+                       (funcall fn object (%object-ref-t object i) i)))
+                    (heap-layout
+                     (dotimes (i (layout-heap-size layout))
+                       (when (eql (bit heap-layout i) 1)
+                         (funcall fn object (%object-ref-t object i) i)))))))
+           (#.+object-tag-closure+
+            (loop
+               for i from 1 below (%object-header-data object)
+               do (funcall fn object (%object-ref-t object i) i)))))))

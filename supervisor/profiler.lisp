@@ -7,16 +7,20 @@
 
 (in-package :mezzano.supervisor)
 
-(defvar *enable-profiling* nil)
+(sys.int::defglobal *enable-profiling* nil)
+(sys.int::defglobal *profile-thread* nil
+  "When non-nil, only this thread will be profiled.")
+(sys.int::defglobal *profile-sample-during-gc* t
+  "When false, samples will not be taken if the world is stopped.")
 
 ;; The profile buffer must be a wired simple-vector.
 ;; It is treated as a circular buffer, when it fill up newer entries
 ;; will replace older entries.
-(defvar *profile-buffer*)
-(defvar *profile-buffer-head*)
-(defvar *profile-buffer-tail*)
+(sys.int::defglobal *profile-buffer*)
+(sys.int::defglobal *profile-buffer-head*)
+(sys.int::defglobal *profile-buffer-tail*)
 
-(defvar *default-profile-buffer-size* (* 1024 1024))
+(sys.int::defglobal *default-profile-buffer-size* (* 1024 1024))
 
 (defun profile-append-entry (thing)
   "Append one THING to the profile buffer, wrapping around as required."
@@ -33,27 +37,28 @@
 
 (defun profile-append-return-address (addr)
   "Append a return address to the profile buffer as a function + offset."
-  (let* ((fn (let ((*pagefault-hook* (dx-lambda (interrupt-frame info fault-addr)
-                                       (declare (ignore interrupt-frame info fault-addr))
-                                       (profile-append-entry addr)
-                                       (profile-append-entry 0)
-                                       (return-from profile-append-return-address))))
+  (let* ((fn (with-page-fault-hook
+                 (()
+                  (profile-append-entry addr)
+                  (profile-append-entry 0)
+                  (abandon-page-fault nil))
                ;; The function might be unmapped and in the pinned area, so it's possible
                ;; that this can fault.
-               (sys.int::return-address-to-function addr)))
-         (fn-address (logand (sys.int::lisp-object-address fn) -16))
-         (offset (- addr fn-address)))
-    (profile-append-entry fn)
-    (profile-append-entry offset)))
+               (sys.int::return-address-to-function addr))))
+    (when fn
+      (let* ((fn-address (logand (sys.int::lisp-object-address fn) -16))
+             (offset (- addr fn-address)))
+        (profile-append-entry fn)
+        (profile-append-entry offset)))))
 
 (defun profile-append-call-stack (initial-frame-pointer)
   "Append a complete-as-possible call stack to the profile buffer."
   ;; If a thread's stack is not mapped in, then this may take a page-fault.
   ;; Produce a truncated sample if that happens.
-  (let ((*pagefault-hook* (dx-lambda (interrupt-frame info fault-addr)
-                            (declare (ignore interrupt-frame info fault-addr))
-                            (profile-append-entry :truncated)
-                            (return-from profile-append-call-stack))))
+  (with-page-fault-hook
+      (()
+       (profile-append-entry :truncated)
+       (abandon-page-fault))
     (do ((fp initial-frame-pointer
              (sys.int::memref-unsigned-byte-64 fp 0)))
         ((eql fp 0))
@@ -65,28 +70,46 @@
 ;;; Watch out, this runs in an interrupt handler.
 (defun profile-sample (interrupt-frame)
   (when (and (boundp '*enable-profiling*)
-             *enable-profiling*)
+             *enable-profiling*
+             (or *profile-sample-during-gc*
+                 (not (world-stopped-p))))
+    (stop-other-cpus-for-debug-magic-button)
     (profile-append-entry :start)
-    ;; Dump the current thread.
-    (profile-append-entry (current-thread))
-    (profile-append-entry :active)
-    (profile-append-entry (thread-wait-item (current-thread)))
-    (profile-append-return-address (interrupt-frame-raw-register interrupt-frame :rip))
-    (profile-append-call-stack (interrupt-frame-raw-register interrupt-frame :rbp))
+    (profile-append-entry (get-internal-real-time))
+    (when (or (not *profile-thread*)
+              (eql *profile-thread* (current-thread)))
+      ;; Dump the current thread.
+      (profile-append-entry (current-thread))
+      (profile-append-entry :active)
+      (profile-append-entry (thread-wait-item (current-thread)))
+      (profile-append-return-address (interrupt-frame-raw-register interrupt-frame :rip))
+      (profile-append-call-stack (interrupt-frame-raw-register interrupt-frame :rbp)))
     ;; And all the others.
-    (loop
-       for thread = *all-threads* then (thread-global-next thread)
-       until (not thread) do
-         (when (not (eql thread (current-thread)))
-           (profile-append-entry thread)
-           (profile-append-entry (thread-state thread))
-           (profile-append-entry (thread-wait-item thread))
-           (when (thread-full-save-p thread)
-             ;; RIP is valid in the save area.
-             (profile-append-return-address (thread-state-rip thread)))
-           (profile-append-call-stack (thread-frame-pointer thread))))))
+    (cond (*profile-thread*
+           (let ((thread *profile-thread*))
+             (when (not (eql thread (current-thread)))
+               (profile-append-entry thread)
+               (profile-append-entry (thread-state thread))
+               (profile-append-entry (thread-wait-item thread))
+               (when (thread-full-save-p thread)
+                 ;; RIP is valid in the save area.
+                 (profile-append-return-address (thread-state-rip thread)))
+               (profile-append-call-stack (thread-frame-pointer thread)))))
+          (t
+           (loop
+              for thread = *all-threads* then (thread-global-next thread)
+              until (not thread) do
+                (when (not (eql thread (current-thread)))
+                  (profile-append-entry thread)
+                  (profile-append-entry (thread-state thread))
+                  (profile-append-entry (thread-wait-item thread))
+                  (when (thread-full-save-p thread)
+                    ;; RIP is valid in the save area.
+                    (profile-append-return-address (thread-state-rip thread)))
+                  (profile-append-call-stack (thread-frame-pointer thread))))))
+    (resume-other-cpus-for-debug-magic-button)))
 
-(defun start-profiling (&optional buffer-size)
+(defun start-profiling (&key buffer-size thread (reset t) (sample-during-gc t))
   "Set up a profile sample buffer and enable sampling."
   (assert (not *enable-profiling*) ()
           "Profiling already started.")
@@ -94,9 +117,13 @@
   (when (or (not (boundp '*profile-buffer*))
             (not *profile-buffer*)
             (not (eql (length *profile-buffer*) buffer-size)))
+    (setf reset t)
     (setf *profile-buffer* (make-array buffer-size :area :wired)))
-  (setf *profile-buffer-head* 0
-        *profile-buffer-tail* 0)
+  (when reset
+    (setf *profile-buffer-head* 0
+          *profile-buffer-tail* 0))
+  (setf *profile-thread* thread)
+  (setf *profile-sample-during-gc* sample-during-gc)
   (setf *enable-profiling* t))
 
 (defun stop-profiling ()
@@ -104,6 +131,7 @@
   (assert *enable-profiling* ()
           "Profiling not started.")
   (setf *enable-profiling* nil)
+  (setf *profile-thread* nil)
   (let* ((n-entries (if (< *profile-buffer-head* *profile-buffer-tail*)
                         (+ (- (length *profile-buffer*) *profile-buffer-tail*)
                            *profile-buffer-head*)

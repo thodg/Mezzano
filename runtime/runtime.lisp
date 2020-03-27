@@ -1,537 +1,607 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
+;;;; Copyright (c) 2011-2017 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
 (in-package :mezzano.runtime)
+
+;; There is a single instance of this used as the unbound value marker by symbols.
+(defstruct (unbound-value
+             (:area :wired))
+  tag)
+
+;; Custom wrapper function because of the declaration.
+(defun (setf sys.int::%%special-stack-pointer) (value)
+  (declare (sys.int::suppress-ssp-checking))
+  (setf (sys.int::%%special-stack-pointer) value))
 
 (defun sys.int::%%unwind-to (target-special-stack-pointer)
   (declare (sys.int::suppress-ssp-checking))
   (loop (when (eq target-special-stack-pointer (sys.int::%%special-stack-pointer))
           (return))
      (assert (sys.int::%%special-stack-pointer))
-     (etypecase (svref (sys.int::%%special-stack-pointer) 1)
-       (symbol
+     (etypecase (sys.int::%object-ref-t (sys.int::%%special-stack-pointer) 1)
+       (symbol-value-cell
         (sys.int::%%unbind))
        (simple-vector
         (sys.int::%%disestablish-block-or-tagbody))
        (function
-        (sys.int::%%disestablish-unwind-protect)))))
+        (sys.int::%%disestablish-unwind-protect))
+       (mezzano.delimited-continuations:prompt-tag
+        ;; Delimited continuation marker.
+        ;; Restore thread's stack object.
+        (setf (mezzano.supervisor::thread-stack (mezzano.supervisor::current-thread))
+              (sys.int::%object-ref-t (sys.int::%%special-stack-pointer) 3))
+        (setf (sys.int::%%special-stack-pointer)
+              (svref (sys.int::%%special-stack-pointer) 0))))))
 
-(sys.int::define-lap-function values-list ((list)
-                                           ((list 0)))
-  "Returns the elements of LIST as multiple values."
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  (sys.lap-x86:sub64 :rsp 16) ; 2 slots
-  (sys.lap-x86:cmp32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:jne bad-arguments)
-  ;; RBX = iterator, (:stack 0) = list.
-  (sys.lap-x86:mov64 :rbx :r8)
-  (sys.lap-x86:mov64 (:stack 0) :r8)
-  (:gc :frame :layout #*10)
-  ;; ECX = value count.
-  (sys.lap-x86:xor32 :ecx :ecx)
-  ;; Pop into R8.
-  ;; If LIST is NIL, then R8 must be NIL, so no need to
-  ;; set R8 to NIL in the 0-values case.
-  (sys.lap-x86:cmp64 :rbx nil)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:mov8 :al :bl)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-cons+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:mov64 :r8 (:car :rbx))
-  (sys.lap-x86:mov64 :rbx (:cdr :rbx))
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  ;; Pop into R9.
-  (sys.lap-x86:cmp64 :rbx nil)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:mov8 :al :bl)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-cons+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:mov64 :r9 (:car :rbx))
-  (sys.lap-x86:mov64 :rbx (:cdr :rbx))
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  ;; Pop into R10.
-  (sys.lap-x86:cmp64 :rbx nil)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:mov8 :al :bl)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-cons+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:mov64 :r10 (:car :rbx))
-  (sys.lap-x86:mov64 :rbx (:cdr :rbx))
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  ;; Pop into R11.
-  (sys.lap-x86:cmp64 :rbx nil)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:mov8 :al :bl)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-cons+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:mov64 :r11 (:car :rbx))
-  (sys.lap-x86:mov64 :rbx (:cdr :rbx))
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  ;; Pop into R12.
-  (sys.lap-x86:cmp64 :rbx nil)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:mov8 :al :bl)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-cons+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:mov64 :r12 (:car :rbx))
-  (sys.lap-x86:mov64 :rbx (:cdr :rbx))
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  ;; Registers are populated, now unpack into the MV-area
-  (sys.lap-x86:mov32 :edi #.(+ (- 8 sys.int::+tag-object+)
-                               (* mezzano.supervisor::+thread-mv-slots-start+ 8)))
-  (:gc :frame :layout #*10 :multiple-values 0)
-  unpack-loop
-  (sys.lap-x86:cmp64 :rbx nil)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:mov8 :al :bl)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-cons+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:cmp32 :ecx #.(ash (+ (- mezzano.supervisor::+thread-mv-slots-end+ mezzano.supervisor::+thread-mv-slots-start+) 5) sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:jae too-many-values)
-  (sys.lap-x86:mov64 :r13 (:car :rbx))
-  (sys.lap-x86:mov64 :rbx (:cdr :rbx))
-  (sys.lap-x86:gs)
-  (sys.lap-x86:mov64 (:rdi) :r13)
-  (:gc :frame :layout #*10 :multiple-values 1)
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (:gc :frame :layout #*10 :multiple-values 0)
-  (sys.lap-x86:add64 :rdi 8)
-  (sys.lap-x86:jmp unpack-loop)
-  done
-  (sys.lap-x86:leave)
-  (:gc :no-frame :multiple-values 0)
-  (sys.lap-x86:ret)
-  type-error
-  (:gc :frame :layout #*10)
-  (sys.lap-x86:mov64 :r8 (:stack 0))
-  (sys.lap-x86:mov64 :r9 (:constant proper-list))
-  (sys.lap-x86:mov64 :r13 (:function sys.int::raise-type-error))
-  (sys.lap-x86:mov32 :ecx #.(ash 2 sys.int::+n-fixnum-bits+)) ; fixnum 2
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:ud2)
-  too-many-values
-  (sys.lap-x86:mov64 :r8 (:constant "Too many values in list ~S."))
-  (sys.lap-x86:mov64 :r9 (:stack 0))
-  (sys.lap-x86:mov64 :r13 (:function error))
-  (sys.lap-x86:mov32 :ecx #.(ash 2 sys.int::+n-fixnum-bits+)) ; fixnum 2
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:ud2)
-  bad-arguments
-  (:gc :frame)
-  (sys.lap-x86:mov64 :r13 (:function sys.int::raise-invalid-argument-error))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:ud2))
+(defmacro do-variable-bindings ((value symbol &optional result) &body body)
+  (let ((ssp (gensym "SSP"))
+        (sym (gensym)))
+    `(loop
+        with ,sym = ,symbol
+        for ,ssp = (sys.int::%%special-stack-pointer) then (sys.int::%object-ref-t ,ssp 0)
+        until (null ,ssp)
+        when (and (symbol-value-cell-p ,ssp)
+                  (eq (symbol-value-cell-symbol ,ssp) ,sym))
+        do (let ((,value (sys.int::%object-ref-t ,ssp 2)))
+             ,@body)
+        finally (return ,result))))
 
-(sys.int::define-lap-function sys.int::values-simple-vector ((simple-vector))
-  "Returns the elements of SIMPLE-VECTOR as multiple values."
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  ;; Check arg count.
-  (sys.lap-x86:cmp64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:jne bad-arguments)
-  ;; Check type.
-  (sys.lap-x86:mov8 :al :r8l)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-object+)
-  (sys.lap-x86:jne type-error)
-  (sys.lap-x86:mov64 :rax (:object :r8 -1))
-  ;; Simple vector object tag is zero.
-  (sys.lap-x86:test8 :al #.(ash (1- (ash 1 sys.int::+object-type-size+))
-                                sys.int::+object-type-shift+))
-  (sys.lap-x86:jnz type-error)
-  ;; Get number of values.
-  (sys.lap-x86:shr64 :rax #.sys.int::+object-data-shift+)
-  (sys.lap-x86:jz zero-values)
-  (sys.lap-x86:cmp64 :rax #.(+ (- mezzano.supervisor::+thread-mv-slots-end+ mezzano.supervisor::+thread-mv-slots-start+) 5))
-  (sys.lap-x86:jae too-many-values)
-  ;; Set up. RBX = vector, RCX = number of values loaded so far, RAX = total number of values.
-  (sys.lap-x86:mov64 :rbx :r8)
-  (sys.lap-x86:xor32 :ecx :ecx)
-  ;; Load register values.
-  (sys.lap-x86:add32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r8 (:object :rbx 0))
-  (sys.lap-x86:cmp64 :rax 1)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:add32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r9 (:object :rbx 1))
-  (sys.lap-x86:cmp64 :rax 2)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:add32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r10 (:object :rbx 2))
-  (sys.lap-x86:cmp64 :rax 3)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:add32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r11 (:object :rbx 3))
-  (sys.lap-x86:cmp64 :rax 4)
-  (sys.lap-x86:je done)
-  (sys.lap-x86:add32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r12 (:object :rbx 4))
-  (sys.lap-x86:cmp64 :rax 5)
-  (sys.lap-x86:je done)
-  ;; Registers are populated, now unpack into the MV-area
-  (sys.lap-x86:mov32 :edi #.(+ (- 8 sys.int::+tag-object+)
-                               (* mezzano.supervisor::+thread-mv-slots-start+ 8)))
-  (sys.lap-x86:mov32 :edx 5) ; Current value.
-  (:gc :frame :multiple-values 0)
-  unpack-loop
-  (sys.lap-x86:mov64 :r13 (:object :rbx 0 :rdx))
-  (sys.lap-x86:gs)
-  (sys.lap-x86:mov64 (:rdi) :r13)
-  (:gc :frame :multiple-values 1)
-  (sys.lap-x86:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+)) ; fixnum 1
-  (:gc :frame :multiple-values 0)
-  (sys.lap-x86:add64 :rdi 8)
-  (sys.lap-x86:add64 :rdx 1)
-  (sys.lap-x86:cmp64 :rdx :rax)
-  (sys.lap-x86:jne unpack-loop)
-  done
-  (sys.lap-x86:leave)
-  (:gc :no-frame :multiple-values 0)
-  (sys.lap-x86:ret)
-  ;; Special-case 0 values as it requires NIL in R8.
-  zero-values
-  (:gc :frame)
-  (sys.lap-x86:mov64 :r8 nil)
-  (sys.lap-x86:xor32 :ecx :ecx)
-  (sys.lap-x86:jmp done)
-  (:gc :frame)
-  type-error
-  (sys.lap-x86:mov64 :r9 (:constant simple-vector))
-  (sys.lap-x86:mov64 :r13 (:function sys.int::raise-type-error))
-  (sys.lap-x86:mov32 :ecx #.(ash 2 sys.int::+n-fixnum-bits+)) ; fixnum 2
-  (sys.lap-x86:call (:object :r13 #.sys.int::+fref-entry-point+))
-  (sys.lap-x86:ud2)
-  too-many-values
-  (sys.lap-x86:mov64 :r8 (:constant "Too many values in simple-vector ~S."))
-  (sys.lap-x86:mov64 :r9 :rbx)
-  (sys.lap-x86:mov64 :r13 (:function error))
-  (sys.lap-x86:mov32 :ecx #.(ash 2 sys.int::+n-fixnum-bits+)) ; fixnum 2
-  (sys.lap-x86:call (:object :r13 #.sys.int::+fref-entry-point+))
-  (sys.lap-x86:ud2)
-  bad-arguments
-  (sys.lap-x86:mov64 :r13 (:function sys.int::raise-invalid-argument-error))
-  (sys.lap-x86:call (:object :r13 #.sys.int::+fref-entry-point+))
-  (sys.lap-x86:ud2))
-
-;;; TODO: This requires a considerably more flexible mechanism.
-(defvar *tls-lock*)
-(defvar sys.int::*next-symbol-tls-slot*)
-(defconstant +maximum-tls-slot+ (1+ mezzano.supervisor::+thread-tls-slots-end+))
-(defun sys.int::%allocate-tls-slot (symbol)
-  (mezzano.supervisor::safe-without-interrupts (symbol)
-    (mezzano.supervisor::with-symbol-spinlock (*tls-lock*)
-      ;; Make sure that another thread didn't allocate a slot while we were waiting for the lock.
-      (cond ((zerop (ldb (byte sys.int::+symbol-header-tls-size+ sys.int::+symbol-header-tls-position+)
-                         (sys.int::%object-header-data symbol)))
-             (when (>= sys.int::*next-symbol-tls-slot* +maximum-tls-slot+)
-               (error "Critial error! TLS slots exhausted!"))
-             (let ((slot sys.int::*next-symbol-tls-slot*))
-               (incf sys.int::*next-symbol-tls-slot*)
-               ;; Twiddle TLS bits directly in the symbol header.
-               (setf (ldb (byte sys.int::+symbol-header-tls-size+ sys.int::+symbol-header-tls-position+)
-                          (sys.int::%object-header-data symbol))
-                     slot)
-               slot))
-            (t (ldb (byte sys.int::+symbol-header-tls-size+ sys.int::+symbol-header-tls-position+)
-                    (sys.int::%object-header-data symbol)))))))
-
+;; Scary note: This is not treated like a normal dynamic variable.
+;; The variable itself is not a list, instead the active binding
+;; cells are used to simulate one.
 (defvar *active-catch-handlers*)
 (defun sys.int::%catch (tag fn)
   ;; Catch is used in low levelish code, so must avoid allocation.
-  (let ((vec (sys.c::make-dx-simple-vector 3)))
-    (setf (svref vec 0) *active-catch-handlers*
-          (svref vec 1) tag
-          (svref vec 2) (flet ((exit-fn (values)
-                                 (return-from sys.int::%catch (values-list values))))
-                          (declare (dynamic-extent (function exit-fn)))
-                          #'exit-fn))
-    (let ((*active-catch-handlers* vec))
+  (flet ((exit-fn (values)
+           (return-from sys.int::%catch (values-list values))))
+    (declare (dynamic-extent (function exit-fn)))
+    (let* ((vec (vector tag #'exit-fn))
+           (*active-catch-handlers* vec))
+      (declare (dynamic-extent vec))
       (funcall fn))))
 
 (defun sys.int::%throw (tag values)
   ;; Note! The VALUES list has dynamic extent!
   ;; This is fine, as the exit function calls VALUES-LIST on it before unwinding.
-  (do ((current *active-catch-handlers* (svref current 0)))
-      ((not current)
-       (error 'sys.int::bad-catch-tag-error :tag tag))
-    (when (eq (svref current 1) tag)
-      (funcall (svref current 2) values))))
+  (do-variable-bindings (value '*active-catch-handlers*
+                         (error 'sys.int::bad-catch-tag-error :tag tag))
+    (when (eq (svref value 0) tag)
+      (funcall (svref value 1) values))))
 
 (defun sys.int::%coerce-to-callable (object)
-  (etypecase object
+  (typecase object
     (function object)
     (symbol
      ;; Fast-path for symbols.
-     (let ((fref (sys.int::%object-ref-t object sys.int::+symbol-function+)))
-       (when (not fref)
-         (return-from sys.int::%coerce-to-callable
-           (fdefinition object)))
-       (let ((fn (sys.int::%object-ref-t fref sys.int::+fref-function+)))
-         (or fn
-             (fdefinition object)))))))
+     (let* ((fref (or (sys.int::%object-ref-t object sys.int::+symbol-function+)
+                      (sys.int::function-reference object)))
+            (fn (sys.int::%object-ref-t fref sys.int::+fref-function+)))
+         (if (eq fn fref)
+             ;; Return a function that will signal an undefined-function error
+             ;; with appropriate restarts when called.
+             ;; This is not inlined so as to avoid closing over object in
+             ;; the common case.
+             (sys.int::make-deferred-undefined-function fref)
+             fn)))
+    (t
+     (sys.int::raise-type-error object '(or function symbol))
+     (%%unreachable))))
 
-;; (defun eql (x y)
-;;   (or (eq x y)
-;;       (and (eq (%tag-field x) +tag-object+)
-;;            (eq (%tag-field y) +tag-object+)
-;;            (eq (%object-tag x) (%object-tag y))
-;;            (<= +first-numeric-object-tag+ (%object-tag x) +last-numeric-object-tag+)
-;;            (= x y))))
-(sys.int::define-lap-function eql ((x y))
-  "Compare X and Y."
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  ;; Check arg count.
-  (sys.lap-x86:cmp64 :rcx #.(ash 2 sys.int::+n-fixnum-bits+)) ; fixnum 2
-  (sys.lap-x86:jne BAD-ARGUMENTS)
-  ;; EQ test.
-  ;; This additionally covers fixnums, characters and single-floats.
-  (sys.lap-x86:cmp64 :r8 :r9)
-  (sys.lap-x86:jne MAYBE-NUMBER-CASE)
-  ;; Objects are EQ.
-  (sys.lap-x86:mov32 :r8d t)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:ret)
-  (:gc :frame)
-  MAYBE-NUMBER-CASE
-  ;; Not EQ.
-  ;; Both must be objects.
-  (sys.lap-x86:mov8 :al :r8l)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-object+)
-  (sys.lap-x86:jne OBJECTS-UNEQUAL)
-  (sys.lap-x86:mov8 :al :r9l)
-  (sys.lap-x86:and8 :al #b1111)
-  (sys.lap-x86:cmp8 :al #.sys.int::+tag-object+)
-  (sys.lap-x86:jne OBJECTS-UNEQUAL)
-  ;; Both are objects.
-  ;; Test that both are the same kind of object.
-  (sys.lap-x86:mov64 :rax (:object :r8 -1))
-  (sys.lap-x86:and8 :al #.(ash (1- (ash 1 sys.int::+object-type-size+))
-                               sys.int::+object-type-shift+))
-  (sys.lap-x86:mov64 :rdx (:object :r9 -1))
-  (sys.lap-x86:and8 :dl #.(ash (1- (ash 1 sys.int::+object-type-size+))
-                               sys.int::+object-type-shift+))
-  (sys.lap-x86:cmp8 :al :dl)
-  (sys.lap-x86:jne OBJECTS-UNEQUAL)
-  ;; They must be numbers. Characters were handled above.
-  (sys.lap-x86:sub8 :al #.(ash sys.int::+first-numeric-object-tag+
-                               sys.int::+object-type-shift+))
-  (sys.lap-x86:cmp8 :al #.(ash (- sys.int::+last-numeric-object-tag+
-                                  sys.int::+first-numeric-object-tag+)
-                               sys.int::+object-type-shift+))
-  (sys.lap-x86:ja OBJECTS-UNEQUAL)
-  ;; Both are numbers of the same type. Tail-call to generic-=.
-  ;; RCX was set to fixnum 2 on entry.
-  (sys.lap-x86:mov64 :r13 (:function sys.int::generic-=))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:jmp (:object :r13 #.sys.int::+fref-entry-point+))
-  (:gc :frame)
-  OBJECTS-UNEQUAL
-  ;; Objects are not EQL.
-  (sys.lap-x86:mov32 :r8d nil)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:ret)
-  (:gc :frame)
-  BAD-ARGUMENTS
-  (sys.lap-x86:mov64 :r13 (:function sys.int::raise-invalid-argument-error))
-  (sys.lap-x86:call (:object :r13 #.sys.int::+fref-entry-point+))
-  (sys.lap-x86:ud2))
+(declaim (inline %object-slot-address))
+(defun %object-slot-address (object slot)
+  (+ (sys.int::lisp-object-address object)
+     (- sys.int::+tag-object+)
+     8
+     (* slot 8)))
+
+(defun %%object-of-type-p (object object-tag)
+  (eq (sys.int::%object-tag object) object-tag))
+
+(declaim (inline sys.int::%object-of-type-p))
+(defun sys.int::%object-of-type-p (object object-tag)
+  (and (sys.int::%value-has-tag-p object sys.int::+tag-object+)
+       (%%object-of-type-p object object-tag)))
+
+(defun %%object-of-type-range-p (object first-object-tag last-object-tag)
+  (<= first-object-tag
+      (sys.int::%object-tag object)
+      last-object-tag))
+
+(declaim (inline sys.int::%object-of-type-range-p))
+(defun sys.int::%object-of-type-range-p (object first-object-tag last-object-tag)
+  (and (sys.int::%value-has-tag-p object sys.int::+tag-object+)
+       (%%object-of-type-range-p object first-object-tag last-object-tag)))
+
+(declaim (inline sys.int::%type-check))
+(defun sys.int::%type-check (object object-tag expected-type)
+  (unless (sys.int::%object-of-type-p object object-tag)
+    (sys.int::raise-type-error object expected-type)
+    (sys.int::%%unreachable)))
+
+(defun sys.int::%value-has-tag-p (value tag)
+  (eql (sys.int::%tag-field value) tag))
+
+(defun sys.int::%value-has-immediate-tag-p (object immediate-tag)
+  (and (sys.int::%value-has-tag-p object sys.int::+tag-immediate+)
+       (eq (ldb sys.int::+immediate-tag+ (sys.int::lisp-object-address object))
+           immediate-tag)))
+
+(declaim (inline characterp))
+(defun characterp (object)
+  (sys.int::%value-has-immediate-tag-p object sys.int::+immediate-tag-character+))
+
+(declaim (inline functionp))
+(defun functionp (object)
+  (sys.int::%object-of-type-range-p
+   object
+   sys.int::+first-function-object-tag+
+   sys.int::+last-function-object-tag+))
 
 (in-package :sys.int)
+
+(defun %progv (symbols values fn)
+  (cond (symbols
+         ;; Bind one.
+         ;; Bindings must be done one at a time because the compiler
+         ;; cannot emit an arbitrary number of special stack entries in a
+         ;; single function.
+         ;; It'd be possible to do in assembly, but complicated enough
+         ;; that it'd not be worthwhile.
+         (let ((symbol (car symbols))
+               (value (if values
+                          (car values)
+                          (%unbound-value))))
+           (check-type symbol symbol)
+           (mezzano.runtime::modifying-symbol-value symbol)
+           (when values
+             (mezzano.runtime::check-symbol-value-type value symbol))
+           (%%bind (mezzano.runtime::symbol-global-value-cell symbol) value)
+           (multiple-value-prog1
+               (%progv (cdr symbols) (cdr values) fn)
+             (%%unbind))))
+        (t ;; No more to bind
+         (funcall fn))))
 
 (defun return-address-to-function (return-address)
   "Convert a return address to a function pointer.
 Dangerous! The return address must be kept live as a return address on a
 thread's stack if this function is called from normal code."
+  ;; Return address must be within the function area.
+  (mezzano.supervisor:ensure
+   (<= sys.int::*wired-function-area-limit*
+       return-address
+       sys.int::*function-area-limit*)
+   "Return address " return-address " in wrong area")
   ;; Walk backwards looking for an object header with a function type and
   ;; an appropriate entry point.
   (loop
      with address = (logand return-address -16)
+     with raise-undefined-function-fref-addr =
+       (sys.int::%function-reference-code-location
+        (get-raise-undefined-function-fref))
      ;; Be careful when reading to avoid bignums.
      for potential-header-type = (ldb (byte +object-type-size+ +object-type-shift+)
                                       (memref-unsigned-byte-8 address 0))
      do
-       (when (and
-              ;; Closures never contain code.
-              (or (eql potential-header-type +object-tag-function+)
-                  (eql potential-header-type +object-tag-funcallable-instance+))
-              ;; Check entry point halves individually, avoiding bignums.
-              ;; Currently the entry point of every non-closure function
-              ;; points to the base-address + 16.
-              (eql (logand (+ address 16) #xFFFFFFFF)
-                   (memref-unsigned-byte-32 (+ address 8) 0))
-              (eql (logand (ash (+ address 16) -32) #xFFFFFFFF)
-                   (memref-unsigned-byte-32 (+ address 12) 0)))
-         (return (%%assemble-value address sys.int::+tag-object+)))
+       (when (or (and
+                  ;; Only compiled functions contain code.
+                  (eql potential-header-type +object-tag-function+)
+                  ;; Check entry point halves individually, avoiding bignums.
+                  ;; Currently the entry point of every non-closure function
+                  ;; points to the base-address + 16.
+                  (eql (logand (+ address 16) #xFFFFFFFF)
+                       (memref-unsigned-byte-32 (+ address 8) 0))
+                  (eql (logand (ash (+ address 16) -32) #xFFFFFFFF)
+                       (memref-unsigned-byte-32 (+ address 12) 0)))
+                 (and
+                  ;; Frefs do too...
+                  (eql potential-header-type +object-tag-function-reference+)
+                  ;; The entry point of an fref always points at the address
+                  ;; of the raise-undefined-function fref entry point.
+                  (eql (logand raise-undefined-function-fref-addr #xFFFFFFFF)
+                       (memref-unsigned-byte-32 (+ address 8) 0))
+                  (eql (logand (ash raise-undefined-function-fref-addr -32) #xFFFFFFFF)
+                       (memref-unsigned-byte-32 (+ address 12) 0))))
+         (return (values (%%assemble-value address sys.int::+tag-object+)
+                         (- return-address address))))
        (decf address 16)))
 
-(defun map-function-gc-metadata (function function-to-inspect)
-  "Call FUNCTION with every GC metadata entry in FUNCTION-TO-INSPECT.
-Arguments to FUNCTION:
- start-offset
- framep
- interruptp
- pushed-values
- pushed-values-register
- layout-address
- layout-length
- multiple-values
- incoming-arguments
- block-or-tagbody-thunk
- extra-registers"
-  (check-type function function)
-  (let* ((fn-address (logand (lisp-object-address function-to-inspect) -16))
-         (header-data (%object-header-data function-to-inspect))
-         (mc-size (* (ldb (byte +function-machine-code-size+
-                                +function-machine-code-position+)
-                          header-data)
-                     16))
-         (n-constants (ldb (byte +function-constant-pool-size+
-                                 +function-constant-pool-position+)
-                           header-data))
-         ;; Address of GC metadata & the length.
-         (address (+ fn-address mc-size (* n-constants 8)))
-         (length (ldb (byte +function-gc-metadata-size+
-                            +function-gc-metadata-position+)
-                      header-data))
-         ;; Position within the metadata.
-         (position 0))
-    (flet ((consume (&optional (errorp t))
-             (when (>= position length)
-               (when errorp
-                 (mezzano.supervisor:panic "Corrupt GC info in function " function-to-inspect))
-               (return-from map-function-gc-metadata))
-             (prog1 (memref-unsigned-byte-8 address position)
-               (incf position))))
-      (declare (dynamic-extent #'consume))
-      (loop (let ((start-offset-in-function 0)
-                  flags-and-pvr
-                  mv-and-ia
-                  (pv 0)
-                  (n-layout-bits 0)
-                  layout-address)
-              ;; Read first byte of address, this is where we can terminate.
-              (let ((byte (consume nil))
-                    (offset 0))
-                (setf start-offset-in-function (ldb (byte 7 0) byte)
-                      offset 7)
-                (when (logtest byte #x80)
-                  ;; Read remaining bytes.
-                  (loop (let ((byte (consume)))
-                          (setf (ldb (byte 7 offset) start-offset-in-function)
-                                (ldb (byte 7 0) byte))
-                          (incf offset 7)
-                          (unless (logtest byte #x80)
-                            (return))))))
-              ;; Read flag/pvr byte
-              (setf flags-and-pvr (consume))
-              ;; Read mv-and-ia
-              (setf mv-and-ia (consume))
-              ;; Read vs32 pv.
-              (let ((shift 0))
-                (loop
-                   (let ((b (consume)))
-                     (when (not (logtest b #x80))
-                       (setf pv (logior pv (ash (logand b #x3F) shift)))
-                       (when (logtest b #x40)
-                         (setf pv (- pv)))
-                       (return))
-                     (setf pv (logior pv (ash (logand b #x7F) shift)))
-                     (incf shift 7))))
-              ;; Read vu32 n-layout bits.
-              (let ((shift 0))
-                (loop
-                   (let ((b (consume)))
-                     (setf n-layout-bits (logior n-layout-bits (ash (logand b #x7F) shift)))
-                     (when (not (logtest b #x80))
-                       (return))
-                     (incf shift 7))))
-              (setf layout-address (+ address position))
-              ;; Consume layout bits.
-              (incf position (ceiling n-layout-bits 8))
-              ;; Decode this entry and do something else.
-              (funcall function
-                       ;; Start offset in the function.
-                       start-offset-in-function
-                       ;; Frame/no-frame.
-                       (logtest flags-and-pvr #b00001)
-                       ;; Interrupt.
-                       (logtest flags-and-pvr #b00010)
-                       ;; Pushed-values.
-                       pv
-                       ;; Pushed-values-register.
-                       (if (logtest flags-and-pvr #b10000)
-                           :rcx
-                           nil)
-                       ;; Layout-address. Fixnum pointer to virtual memory
-                       ;; the inspected function must remain live to keep
-                       ;; this valid.
-                       layout-address
-                       ;; Number of bits in the layout.
-                       n-layout-bits
-                       ;; Multiple-values.
-                       (if (eql (ldb (byte 4 0) mv-and-ia) 15)
-                           nil
-                           (ldb (byte 4 0) mv-and-ia))
-                       ;; Incoming-arguments.
-                       (if (logtest flags-and-pvr #b1000)
-                           (if (eql (ldb (byte 4 4) mv-and-ia) 15)
-                               :rcx
-                               (ldb (byte 4 4) mv-and-ia))
-                           nil)
-                       ;; Block-or-tagbody-thunk.
-                       (if (logtest flags-and-pvr #b0100)
-                           :rax
-                           nil)
-                       ;; Extra-registers.
-                       (case (ldb (byte 2 6) flags-and-pvr)
-                         (0 nil)
-                         (1 :rax)
-                         (2 :rax-rcx)
-                         (3 :rax-rcx-rdx))))))))
+(declaim (inline memref-t (setf memref-t) (cas memref-t)))
+(defun memref-t (base &optional (index 0))
+  (%memref-t base index))
+(defun (setf memref-t) (value base &optional (index 0))
+  (setf (%memref-t base index) value))
+(defun (cas memref-t) (old new base &optional (index 0))
+  (cas (%memref-t base index) old new))
 
-(define-lap-function %copy-words ((destination-address source-address count))
-  "Copy COUNT words from SOURCE-ADDRESS to DESTINATION-ADDRESS.
-Source & destination must both be byte addresses."
-  (sys.lap-x86:mov64 :rdi :r8) ; Destination
-  (sys.lap-x86:mov64 :rsi :r9) ; Source
-  (sys.lap-x86:mov64 :rcx :r10) ; Count
-  (sys.lap-x86:sar64 :rdi #.+n-fixnum-bits+) ; Unbox destination
-  (sys.lap-x86:sar64 :rsi #.+n-fixnum-bits+) ; Unbox source
-  (sys.lap-x86:sar64 :rcx #.+n-fixnum-bits+) ; Unbox count
-  (sys.lap-x86:rep)
-  (sys.lap-x86:movs64)
-  (sys.lap-x86:ret))
+(declaim (inline memref-unsigned-byte-8 (setf memref-unsigned-byte-8) (cas memref-unsigned-byte-8)))
+(defun memref-unsigned-byte-8 (base &optional (index 0))
+  (%memref-unsigned-byte-8 base index))
+(defun (setf memref-unsigned-byte-8) (value base &optional (index 0))
+  (setf (%memref-unsigned-byte-8 base index) value))
+(defun (cas memref-unsigned-byte-8) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-8 base index) old new))
 
-(define-lap-function %fill-words ((destination-address value count))
-  "Store VALUE into COUNT words starting at DESTINATION-ADDRESS.
-Destination must a be byte address.
-VALUE must be an immediate value (fixnum, character, single-float, NIL or T) or
-the GC must be deferred during FILL-WORDS."
-  (sys.lap-x86:mov64 :rdi :r8) ; Destination
-  (sys.lap-x86:mov64 :rax :r9) ; Value
-  (sys.lap-x86:mov64 :rcx :r10) ; Count
-  (sys.lap-x86:sar64 :rdi #.+n-fixnum-bits+) ; Unbox destination
-  (sys.lap-x86:sar64 :rcx #.+n-fixnum-bits+) ; Unbox count
-  (sys.lap-x86:rep)
-  (sys.lap-x86:stos64)
-  (sys.lap-x86:ret))
+(declaim (inline memref-unsigned-byte-16 (setf memref-unsigned-byte-16) (cas memref-unsigned-byte-16)))
+(defun memref-unsigned-byte-16 (base &optional (index 0))
+  (%memref-unsigned-byte-16 base index))
+(defun (setf memref-unsigned-byte-16) (value base &optional (index 0))
+  (setf (%memref-unsigned-byte-16 base index) value))
+(defun (cas memref-unsigned-byte-16) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-16 base index) old new))
+
+(declaim (inline memref-unsigned-byte-32 (setf memref-unsigned-byte-32) (cas memref-unsigned-byte-32)))
+(defun memref-unsigned-byte-32 (base &optional (index 0))
+  (%memref-unsigned-byte-32 base index))
+(defun (setf memref-unsigned-byte-32) (value base &optional (index 0))
+  (setf (%memref-unsigned-byte-32 base index) value))
+(defun (cas memref-unsigned-byte-32) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-32 base index) old new))
+
+(declaim (inline memref-unsigned-byte-64 (setf memref-unsigned-byte-64) (cas memref-unsigned-byte-64)))
+(defun memref-unsigned-byte-64 (base &optional (index 0))
+  (%memref-unsigned-byte-64 base index))
+(defun (setf memref-unsigned-byte-64) (value base &optional (index 0))
+  (setf (%memref-unsigned-byte-64 base index) value))
+(defun (cas memref-unsigned-byte-64) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-64 base index) old new))
+
+(declaim (inline memref-signed-byte-8 (setf memref-signed-byte-8) (cas memref-signed-byte-8)))
+(defun memref-signed-byte-8 (base &optional (index 0))
+  (%memref-signed-byte-8 base index))
+(defun (setf memref-signed-byte-8) (value base &optional (index 0))
+  (setf (%memref-signed-byte-8 base index) value))
+(defun (cas memref-signed-byte-8) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-8 base index) old new))
+
+(declaim (inline memref-signed-byte-16 (setf memref-signed-byte-16) (cas memref-signed-byte-16)))
+(defun memref-signed-byte-16 (base &optional (index 0))
+  (%memref-signed-byte-16 base index))
+(defun (setf memref-signed-byte-16) (value base &optional (index 0))
+  (setf (%memref-signed-byte-16 base index) value))
+(defun (cas memref-signed-byte-16) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-16 base index) old new))
+
+(declaim (inline memref-signed-byte-32 (setf memref-signed-byte-32) (cas memref-signed-byte-32)))
+(defun memref-signed-byte-32 (base &optional (index 0))
+  (%memref-signed-byte-32 base index))
+(defun (setf memref-signed-byte-32) (value base &optional (index 0))
+  (setf (%memref-signed-byte-32 base index) value))
+(defun (cas memref-signed-byte-32) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-32 base index) old new))
+
+(declaim (inline memref-signed-byte-64 (setf memref-signed-byte-64) (cas memref-signed-byte-64)))
+(defun memref-signed-byte-64 (base &optional (index 0))
+  (%memref-signed-byte-64 base index))
+(defun (setf memref-signed-byte-64) (value base &optional (index 0))
+  (setf (%memref-signed-byte-64 base index) value))
+(defun (cas memref-signed-byte-64) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-64 base index) old new))
+
+(declaim (inline memref-single-float (setf memref-single-float) (cas memref-single-float)))
+(defun memref-single-float (base &optional (index 0))
+  (%integer-as-single-float (%memref-unsigned-byte-32 base index)))
+(defun (setf memref-single-float) (value base &optional (index 0))
+  (check-type value single-float)
+  (setf (%memref-unsigned-byte-32 base index) (%single-float-as-integer value)))
+(defun (cas memref-single-float) (old new base &optional (index 0))
+  (check-type old single-float)
+  (check-type new single-float)
+  (%integer-as-single-float
+   (cas (%memref-unsigned-byte-32 base index)
+        (%single-float-as-integer old)
+        (%single-float-as-integer new))))
+
+(declaim (inline memref-double-float (setf memref-double-float) (cas memref-double-float)))
+(defun memref-double-float (base &optional (index 0))
+  (%integer-as-double-float (%memref-unsigned-byte-64 base index)))
+(defun (setf memref-double-float) (value base &optional (index 0))
+  (check-type value double-float)
+  (setf (%memref-unsigned-byte-64 base index) (%double-float-as-integer value)))
+(defun (cas memref-double-float) (old new base &optional (index 0))
+  (check-type old double-float)
+  (check-type new double-float)
+  (%integer-as-double-float
+   (cas (%memref-unsigned-byte-64 base index)
+        (%double-float-as-integer old)
+        (%double-float-as-integer new))))
+
+(declaim (inline (cas %object-ref-t)))
+(defun %object-ref-t (object index)
+  (%object-ref-t object index))
+(defun (setf %object-ref-t) (value object index)
+  (setf (%object-ref-t object index) value))
+(defun (cas %object-ref-t) (old new object index)
+  (multiple-value-bind (successp actual-value)
+      (%cas-object object index old new)
+    (declare (ignore successp))
+    actual-value))
+
+(declaim (inline %object-ref-unsigned-byte-8 (setf %object-ref-unsigned-byte-8) (cas %object-ref-unsigned-byte-8)))
+(defun %object-ref-unsigned-byte-8 (object index)
+  (%%object-ref-unsigned-byte-8 object index))
+(defun (setf %object-ref-unsigned-byte-8) (value object index)
+  (check-type value (unsigned-byte 8))
+  (setf (%%object-ref-unsigned-byte-8 object index) value))
+(defun (cas %object-ref-unsigned-byte-8) (old new object index)
+  (check-type old (unsigned-byte 8))
+  (check-type new (unsigned-byte 8))
+  (cas (%%object-ref-unsigned-byte-8 object index) old new))
+
+(declaim (inline %object-ref-unsigned-byte-16 (setf %object-ref-unsigned-byte-16) (cas %object-ref-unsigned-byte-16)))
+(defun %object-ref-unsigned-byte-16 (object index)
+  (%%object-ref-unsigned-byte-16 object index))
+(defun (setf %object-ref-unsigned-byte-16) (value object index)
+  (check-type value (unsigned-byte 16))
+  (setf (%%object-ref-unsigned-byte-16 object index) value))
+(defun (cas %object-ref-unsigned-byte-16) (old new object index)
+  (check-type old (unsigned-byte 16))
+  (check-type new (unsigned-byte 16))
+  (cas (%%object-ref-unsigned-byte-16 object index) old new))
+
+(declaim (inline %object-ref-unsigned-byte-32 (setf %object-ref-unsigned-byte-32) (cas %object-ref-unsigned-byte-32)))
+(defun %object-ref-unsigned-byte-32 (object index)
+  (%%object-ref-unsigned-byte-32 object index))
+(defun (setf %object-ref-unsigned-byte-32) (value object index)
+  (check-type value (unsigned-byte 32))
+  (setf (%%object-ref-unsigned-byte-32 object index) value))
+(defun (cas %object-ref-unsigned-byte-32) (old new object index)
+  (check-type old (unsigned-byte 32))
+  (check-type new (unsigned-byte 32))
+  (cas (%%object-ref-unsigned-byte-32 object index) old new))
+
+(declaim (inline %object-ref-unsigned-byte-64 (setf %object-ref-unsigned-byte-64) (cas %object-ref-unsigned-byte-64)))
+(defun %object-ref-unsigned-byte-64 (object index)
+  (%%object-ref-unsigned-byte-64 object index))
+(defun (setf %object-ref-unsigned-byte-64) (value object index)
+  (check-type value (unsigned-byte 64))
+  (setf (%%object-ref-unsigned-byte-64 object index) value))
+(defun (cas %object-ref-unsigned-byte-64) (old new object index)
+  (check-type old (unsigned-byte 64))
+  (check-type new (unsigned-byte 64))
+  (cas (%%object-ref-unsigned-byte-64 object index) old new))
+
+(declaim (inline %object-ref-signed-byte-8 (setf %object-ref-signed-byte-8) (cas %object-ref-signed-byte-8)))
+(defun %object-ref-signed-byte-8 (object index)
+  (%%object-ref-signed-byte-8 object index))
+(defun (setf %object-ref-signed-byte-8) (value object index)
+  (check-type value (signed-byte 8))
+  (setf (%%object-ref-signed-byte-8 object index) value))
+(defun (cas %object-ref-signed-byte-8) (old new object index)
+  (check-type old (signed-byte 8))
+  (check-type new (signed-byte 8))
+  (cas (%%object-ref-signed-byte-8 object index) old new))
+
+(declaim (inline %object-ref-signed-byte-16 (setf %object-ref-signed-byte-16) (cas %object-ref-signed-byte-16)))
+(defun %object-ref-signed-byte-16 (object index)
+  (%%object-ref-signed-byte-16 object index))
+(defun (setf %object-ref-signed-byte-16) (value object index)
+  (check-type value (signed-byte 16))
+  (setf (%%object-ref-signed-byte-16 object index) value))
+(defun (cas %object-ref-signed-byte-16) (old new object index)
+  (check-type old (signed-byte 16))
+  (check-type new (signed-byte 16))
+  (cas (%%object-ref-signed-byte-16 object index) old new))
+
+(declaim (inline %object-ref-signed-byte-32 (setf %object-ref-signed-byte-32) (cas %object-ref-signed-byte-32)))
+(defun %object-ref-signed-byte-32 (object index)
+  (%%object-ref-signed-byte-32 object index))
+(defun (setf %object-ref-signed-byte-32) (value object index)
+  (check-type value (signed-byte 32))
+  (setf (%%object-ref-signed-byte-32 object index) value))
+(defun (cas %object-ref-signed-byte-32) (old new object index)
+  (check-type old (signed-byte 32))
+  (check-type new (signed-byte 32))
+  (cas (%%object-ref-signed-byte-32 object index) old new))
+
+(declaim (inline %object-ref-signed-byte-64 (setf %object-ref-signed-byte-64) (cas %object-ref-signed-byte-64)))
+(defun %object-ref-signed-byte-64 (object index)
+  (%%object-ref-signed-byte-64 object index))
+(defun (setf %object-ref-signed-byte-64) (value object index)
+  (check-type value (signed-byte 64))
+  (setf (%%object-ref-signed-byte-64 object index) value))
+(defun (cas %object-ref-signed-byte-64) (old new object index)
+  (check-type old (signed-byte 64))
+  (check-type new (signed-byte 64))
+  (cas (%%object-ref-signed-byte-64 object index) old new))
+
+(declaim (inline %object-ref-single-float (setf %object-ref-single-float) (cas %object-ref-single-float)))
+(defun %object-ref-single-float (object index)
+  (%%object-ref-single-float object index))
+(defun (setf %object-ref-single-float) (value object index)
+  (check-type value single-float)
+  (setf (%%object-ref-single-float object index) value)
+  value)
+(defun (cas %object-ref-single-float) (old new object index)
+  (check-type old single-float)
+  (check-type new single-float)
+  (cas (%%object-ref-single-float object index) old new))
+
+(declaim (inline %%object-ref-single-float (setf %%object-ref-single-float) (cas %%object-ref-single-float)))
+(defun %%object-ref-single-float (object index)
+  (%integer-as-single-float (%%object-ref-unsigned-byte-32 object index)))
+(defun (setf %%object-ref-single-float) (value object index)
+  (setf (%%object-ref-unsigned-byte-32 object index)
+        (%single-float-as-integer value))
+  value)
+(defun (cas %%object-ref-single-float) (old new object index)
+  (%integer-as-single-float
+   (cas (%%object-ref-unsigned-byte-32 object index)
+        (%single-float-as-integer old)
+        (%single-float-as-integer new))))
+
+(declaim (inline %object-ref-double-float (setf %object-ref-double-float) (cas %object-ref-double-float)))
+(defun %object-ref-double-float (object index)
+  (%integer-as-double-float (%object-ref-unsigned-byte-64 object index)))
+(defun (setf %object-ref-double-float) (value object index)
+  (check-type value double-float)
+  (setf (%object-ref-unsigned-byte-64 object index)
+        (%double-float-as-integer value))
+  value)
+(defun (cas %object-ref-double-float) (old new object index)
+  (check-type old double-float)
+  (check-type new double-float)
+  (%integer-as-double-float
+   (cas (%object-ref-unsigned-byte-64 object index)
+        (%double-float-as-integer old)
+        (%double-float-as-integer new))))
+
+(declaim (inline %object-ref-unsigned-byte-8-unscaled (setf %object-ref-unsigned-byte-8-unscaled) (cas %object-ref-unsigned-byte-8-unscaled)))
+(defun %object-ref-unsigned-byte-8-unscaled (object index)
+  (%%object-ref-unsigned-byte-8-unscaled object index))
+(defun (setf %object-ref-unsigned-byte-8-unscaled) (value object index)
+  (check-type value (unsigned-byte 8))
+  (setf (%%object-ref-unsigned-byte-8-unscaled object index) value))
+(defun (cas %object-ref-unsigned-byte-8-unscaled) (old new object index)
+  (check-type old (unsigned-byte 8))
+  (check-type new (unsigned-byte 8))
+  (cas (%%object-ref-unsigned-byte-8-unscaled object index) old new))
+
+(declaim (inline %object-ref-unsigned-byte-16-unscaled (setf %object-ref-unsigned-byte-16-unscaled) (cas %object-ref-unsigned-byte-16-unscaled)))
+(defun %object-ref-unsigned-byte-16-unscaled (object index)
+  (%%object-ref-unsigned-byte-16-unscaled object index))
+(defun (setf %object-ref-unsigned-byte-16-unscaled) (value object index)
+  (check-type value (unsigned-byte 16))
+  (setf (%%object-ref-unsigned-byte-16-unscaled object index) value))
+(defun (cas %object-ref-unsigned-byte-16-unscaled) (old new object index)
+  (check-type old (unsigned-byte 16))
+  (check-type new (unsigned-byte 16))
+  (cas (%%object-ref-unsigned-byte-16-unscaled object index) old new))
+
+(declaim (inline %object-ref-unsigned-byte-32-unscaled (setf %object-ref-unsigned-byte-32-unscaled) (cas %object-ref-unsigned-byte-32-unscaled)))
+(defun %object-ref-unsigned-byte-32-unscaled (object index)
+  (%%object-ref-unsigned-byte-32-unscaled object index))
+(defun (setf %object-ref-unsigned-byte-32-unscaled) (value object index)
+  (check-type value (unsigned-byte 32))
+  (setf (%%object-ref-unsigned-byte-32-unscaled object index) value))
+(defun (cas %object-ref-unsigned-byte-32-unscaled) (old new object index)
+  (check-type old (unsigned-byte 32))
+  (check-type new (unsigned-byte 32))
+  (cas (%%object-ref-unsigned-byte-32-unscaled object index) old new))
+
+(declaim (inline %object-ref-unsigned-byte-64-unscaled (setf %object-ref-unsigned-byte-64-unscaled) (cas %object-ref-unsigned-byte-64-unscaled)))
+(defun %object-ref-unsigned-byte-64-unscaled (object index)
+  (%%object-ref-unsigned-byte-64-unscaled object index))
+(defun (setf %object-ref-unsigned-byte-64-unscaled) (value object index)
+  (check-type value (unsigned-byte 64))
+  (setf (%%object-ref-unsigned-byte-64-unscaled object index) value))
+(defun (cas %object-ref-unsigned-byte-64-unscaled) (old new object index)
+  (check-type old (unsigned-byte 64))
+  (check-type new (unsigned-byte 64))
+  (cas (%%object-ref-unsigned-byte-64-unscaled object index) old new))
+
+(declaim (inline %object-ref-signed-byte-8-unscaled (setf %object-ref-signed-byte-8-unscaled) (cas %object-ref-signed-byte-8-unscaled)))
+(defun %object-ref-signed-byte-8-unscaled (object index)
+  (%%object-ref-signed-byte-8-unscaled object index))
+(defun (setf %object-ref-signed-byte-8-unscaled) (value object index)
+  (check-type value (signed-byte 8))
+  (setf (%%object-ref-signed-byte-8-unscaled object index) value))
+(defun (cas %object-ref-signed-byte-8-unscaled) (old new object index)
+  (check-type old (signed-byte 8))
+  (check-type new (signed-byte 8))
+  (cas (%%object-ref-signed-byte-8-unscaled object index) old new))
+
+(declaim (inline %object-ref-signed-byte-16-unscaled (setf %object-ref-signed-byte-16-unscaled) (cas %object-ref-signed-byte-16-unscaled)))
+(defun %object-ref-signed-byte-16-unscaled (object index)
+  (%%object-ref-signed-byte-16-unscaled object index))
+(defun (setf %object-ref-signed-byte-16-unscaled) (value object index)
+  (check-type value (signed-byte 16))
+  (setf (%%object-ref-signed-byte-16-unscaled object index) value))
+(defun (cas %object-ref-signed-byte-16-unscaled) (old new object index)
+  (check-type old (signed-byte 16))
+  (check-type new (signed-byte 16))
+  (cas (%%object-ref-signed-byte-16-unscaled object index) old new))
+
+(declaim (inline %object-ref-signed-byte-32-unscaled (setf %object-ref-signed-byte-32-unscaled) (cas %object-ref-signed-byte-32-unscaled)))
+(defun %object-ref-signed-byte-32-unscaled (object index)
+  (%%object-ref-signed-byte-32-unscaled object index))
+(defun (setf %object-ref-signed-byte-32-unscaled) (value object index)
+  (check-type value (signed-byte 32))
+  (setf (%%object-ref-signed-byte-32-unscaled object index) value))
+(defun (cas %object-ref-signed-byte-32-unscaled) (old new object index)
+  (check-type old (signed-byte 32))
+  (check-type new (signed-byte 32))
+  (cas (%%object-ref-signed-byte-32-unscaled object index) old new))
+
+(declaim (inline %object-ref-signed-byte-64-unscaled (setf %object-ref-signed-byte-64-unscaled) (cas %object-ref-signed-byte-64-unscaled)))
+(defun %object-ref-signed-byte-64-unscaled (object index)
+  (%%object-ref-signed-byte-64-unscaled object index))
+(defun (setf %object-ref-signed-byte-64-unscaled) (value object index)
+  (check-type value (signed-byte 64))
+  (setf (%%object-ref-signed-byte-64-unscaled object index) value))
+(defun (cas %object-ref-signed-byte-64-unscaled) (old new object index)
+  (check-type old (signed-byte 64))
+  (check-type new (signed-byte 64))
+  (cas (%%object-ref-signed-byte-64-unscaled object index) old new))
+
+(declaim (inline %object-ref-single-float-unscaled (setf %object-ref-single-float-unscaled) (cas %object-ref-single-float-unscaled)))
+(defun %object-ref-single-float-unscaled (object index)
+  (%%object-ref-single-float-unscaled object index))
+(defun (setf %object-ref-single-float-unscaled) (value object index)
+  (check-type value single-float)
+  (setf (%%object-ref-single-float-unscaled object index) value)
+  value)
+(defun (cas %object-ref-single-float-unscaled) (old new object index)
+  (check-type old single-float)
+  (check-type new single-float)
+  (cas (%%object-ref-single-float-unscaled object index) old new))
+
+(declaim (inline %%object-ref-single-float-unscaled (setf %%object-ref-single-float-unscaled) (cas %%object-ref-single-float-unscaled)))
+(defun %%object-ref-single-float-unscaled (object index)
+  (%integer-as-single-float (%%object-ref-unsigned-byte-32-unscaled object index)))
+(defun (setf %%object-ref-single-float-unscaled) (value object index)
+  (setf (%%object-ref-unsigned-byte-32-unscaled object index)
+        (%single-float-as-integer value))
+  value)
+(defun (cas %%object-ref-single-float-unscaled) (old new object index)
+  (%integer-as-single-float
+   (cas (%%object-ref-unsigned-byte-32-unscaled object index)
+        (%single-float-as-integer old)
+        (%single-float-as-integer new))))
+
+(declaim (inline %object-ref-double-float-unscaled (setf %object-ref-double-float-unscaled) (cas %object-ref-double-float-unscaled)))
+(defun %object-ref-double-float-unscaled (object index)
+  (%integer-as-double-float (%object-ref-unsigned-byte-64-unscaled object index)))
+(defun (setf %object-ref-double-float-unscaled) (value object index)
+  (check-type value double-float)
+  (setf (%object-ref-unsigned-byte-64-unscaled object index)
+        (%double-float-as-integer value))
+  value)
+(defun (cas %%object-ref-double-float-unscaled) (old new object index)
+  (check-type old double-float)
+  (check-type new double-float)
+  (%integer-as-double-float
+   (cas (%%object-ref-unsigned-byte-64-unscaled object index)
+        (%double-float-as-integer old)
+        (%double-float-as-integer new))))
+
+(declaim (inline %in-bounds-p))
+(defun %in-bounds-p (index limit)
+  "Test 0 <= INDEX < LIMIT. INDEX & LIMIT must both be fixnums."
+  ;; Negative 2's compliment values are extremely large positive values
+  ;; when treated as unsigned, this folds two tests into one.
+  (mezzano.runtime::%fixnum-<-unsigned (the fixnum index) (the fixnum limit)))
+
+(declaim (inline %bounds-check))
+(defun %bounds-check (object slot)
+  (unless (fixnump slot)
+    (raise-type-error slot 'fixnum)
+    (sys.int::%%unreachable))
+  (unless (%in-bounds-p slot (%object-header-data object))
+    (raise-bounds-error object slot)
+    (sys.int::%%unreachable)))
+
+(declaim (inline %complex-bounds-check))
+(defun %complex-bounds-check (array index dim axis)
+  (unless (fixnump index)
+    (raise-type-error index 'fixnum)
+    (sys.int::%%unreachable))
+  (unless (%in-bounds-p index dim)
+    (sys.int::raise-complex-bounds-error array index dim axis)
+    (sys.int::%%unreachable)))
+
+;; This is handled specially by the compiler & doesn't go through the
+;; normal builtin mechanism. Specifically provide a wrapper function
+;; for it.
+(defun %%unreachable ()
+  (%%unreachable))

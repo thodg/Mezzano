@@ -1,43 +1,87 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
+;; Required for the cross-compiler.
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+
+(defstruct (specialized-array-definition
+             (:type vector))
+  type
+  tag
+  element-size
+  pad-p
+  zero-element)
+
+)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
 ;; Information about the various specialized arrays.
-;; A list of (type tag size-in-bits 16-byte-aligned-p) lists.
+;; A list of (type tag size-in-bits 16-byte-aligned-p zero-value) lists.
 ;; This must be sorted from most-specific type to least-specific type.
 (defvar *array-info*)
+;; Info for T and BIT arrays.
+(defvar *array-t-info*)
+(defvar *array-bit-info*)
+(defvar *array-character-info*)
 ;; A simple-vector mapping simple 1D array object tags to their element type.
 (defvar *array-types*)
 
 (defun cold-array-initialization ()
   "Called during cold-load to initialize array support variables."
+  (setf *array-t-info* (make-specialized-array-definition :type 't
+                                                          :tag +object-tag-array-t+
+                                                          :element-size 64
+                                                          :pad-p nil
+                                                          :zero-element 0)
+        *array-bit-info* (make-specialized-array-definition :type 'bit
+                                                            :tag +object-tag-array-bit+
+                                                            :element-size 1
+                                                            :pad-p nil
+                                                            :zero-element 0)
+        *array-character-info* (make-specialized-array-definition :type 'character
+                                                                  :tag nil
+                                                                  :element-size nil
+                                                                  :pad-p nil
+                                                                  :zero-element #\Nul))
   (setf *array-info*
-        '((bit                    #.+object-tag-array-bit+                    1 nil)
-          ((unsigned-byte 2)      #.+object-tag-array-unsigned-byte-2+        2 nil)
-          ((unsigned-byte 4)      #.+object-tag-array-unsigned-byte-4+        4 nil)
-          ((unsigned-byte 8)      #.+object-tag-array-unsigned-byte-8+        8 nil)
-          ((unsigned-byte 16)     #.+object-tag-array-unsigned-byte-16+      16 nil)
-          ((unsigned-byte 32)     #.+object-tag-array-unsigned-byte-32+      32 nil)
-          ((unsigned-byte 64)     #.+object-tag-array-unsigned-byte-64+      64 nil)
-          ((signed-byte 1)        #.+object-tag-array-signed-byte-1+          1 nil)
-          ((signed-byte 2)        #.+object-tag-array-signed-byte-2+          2 nil)
-          ((signed-byte 4)        #.+object-tag-array-signed-byte-4+          4 nil)
-          ((signed-byte 8)        #.+object-tag-array-signed-byte-8+          8 nil)
-          ((signed-byte 16)       #.+object-tag-array-signed-byte-16+        16 nil)
-          ((signed-byte 32)       #.+object-tag-array-signed-byte-32+        32 nil)
-          (fixnum                 #.+object-tag-array-fixnum+                64 nil)
-          ((signed-byte 64)       #.+object-tag-array-signed-byte-64+        64 nil)
-          (single-float           #.+object-tag-array-single-float+          32 t)
-          (double-float           #.+object-tag-array-double-float+          64 t)
-          (short-float            #.+object-tag-array-short-float+           16 t)
-          (long-float             #.+object-tag-array-long-float+           128 t)
-          (xmm-vector             #.+object-tag-array-xmm-vector+           128 t)
-          ((complex single-float) #.+object-tag-array-complex-single-float+  64 t)
-          ((complex double-float) #.+object-tag-array-complex-double-float+ 128 t)
-          ((complex short-float)  #.+object-tag-array-complex-short-float+   32 t)
-          ((complex long-float)   #.+object-tag-array-complex-long-float+   256 t)
-          (t                      #.+object-tag-array-t+                     64 nil)))
+        (loop for (type tag element-size pad-p zero-element) in
+             '((bit)
+               ((unsigned-byte 2)      #.+object-tag-array-unsigned-byte-2+        2 nil 0)
+               ((unsigned-byte 4)      #.+object-tag-array-unsigned-byte-4+        4 nil 0)
+               ((unsigned-byte 8)      #.+object-tag-array-unsigned-byte-8+        8 nil 0)
+               ((unsigned-byte 16)     #.+object-tag-array-unsigned-byte-16+      16 nil 0)
+               ((unsigned-byte 32)     #.+object-tag-array-unsigned-byte-32+      32 nil 0)
+               ((unsigned-byte 64)     #.+object-tag-array-unsigned-byte-64+      64 nil 0)
+               ((signed-byte 1)        #.+object-tag-array-signed-byte-1+          1 nil 0)
+               ((signed-byte 2)        #.+object-tag-array-signed-byte-2+          2 nil 0)
+               ((signed-byte 4)        #.+object-tag-array-signed-byte-4+          4 nil 0)
+               ((signed-byte 8)        #.+object-tag-array-signed-byte-8+          8 nil 0)
+               ((signed-byte 16)       #.+object-tag-array-signed-byte-16+        16 nil 0)
+               ((signed-byte 32)       #.+object-tag-array-signed-byte-32+        32 nil 0)
+               (fixnum                 #.+object-tag-array-fixnum+                64 nil 0)
+               ((signed-byte 64)       #.+object-tag-array-signed-byte-64+        64 nil 0)
+               (single-float           #.+object-tag-array-single-float+          32 t   0.0f0)
+               (double-float           #.+object-tag-array-double-float+          64 t   0.0d0)
+               (short-float            #.+object-tag-array-short-float+           16 t   0.0s0)
+               (long-float             #.+object-tag-array-long-float+           128 t   0.0l0)
+               ((complex single-float) #.+object-tag-array-complex-single-float+  64 t   #C(0.0f0 0.0f0))
+               ((complex double-float) #.+object-tag-array-complex-double-float+ 128 t   #C(0.0d0 0.0d0))
+               ((complex short-float)  #.+object-tag-array-complex-short-float+   32 t   #C(0.0s0 0.0s0))
+               ((complex long-float)   #.+object-tag-array-complex-long-float+   256 t   #C(0.0l0 0.0l0))
+               (character)
+               (t))
+           collect (case type
+                     ((bit) *array-bit-info*)
+                     ((character) *array-character-info*)
+                     ((t) *array-t-info*)
+                     (t (make-specialized-array-definition :type type
+                                                           :tag tag
+                                                           :element-size element-size
+                                                           :pad-p pad-p
+                                                           :zero-element zero-element)))))
   (setf *array-types*
         #(t
           fixnum
@@ -62,17 +106,20 @@
           (complex single-float)
           (complex double-float)
           (complex short-float)
-          (complex long-float)
-          xmm-vector)))
+          (complex long-float))))
 
-(defun make-simple-array-1 (length real-element-type area)
-  (let* ((info (assoc real-element-type *array-info* :test 'equal))
-         (total-size (+ (if (fourth info) 64 0) ; padding for alignment.
-                        (* length (third info)))))
+;; Only for the benefit of the cross-compiler,
+;; this is the very first thing INITIALIZE-LISP calls.
+(cold-array-initialization)
+)
+
+(defun make-simple-array-1 (length info area)
+  (let* ((total-size (+ (if (specialized-array-definition-pad-p info) 64 0) ; padding for alignment.
+                        (* length (specialized-array-definition-element-size info)))))
     ;; Align on a word boundary.
     (unless (zerop (rem total-size 64))
       (incf total-size (- 64 (rem total-size 64))))
-    (%allocate-object (second info) (truncate total-size 64) length area)))
+    (mezzano.runtime::%allocate-object (specialized-array-definition-tag info) length (truncate total-size 64) area)))
 
 (defun sign-extend (value width)
   "Convert an unsigned integer to a signed value."
@@ -135,7 +182,17 @@
     (#.+object-tag-array-signed-byte-64+
      (%object-ref-signed-byte-64 array index))
     (#.+object-tag-array-single-float+
-     (%integer-as-single-float (%object-ref-unsigned-byte-32 array index)))))
+     (%object-ref-single-float array index))
+    (#.+object-tag-array-double-float+
+     (%object-ref-double-float array index))
+    (#.+object-tag-array-complex-single-float+
+     (complex
+      (%object-ref-single-float array (* index 2))
+      (%object-ref-single-float array (1+ (* index 2)))))
+    (#.+object-tag-array-complex-double-float+
+     (complex
+      (%object-ref-double-float array (* index 2))
+      (%object-ref-double-float array (1+ (* index 2)))))))
 
 (defun (setf %simple-array-aref) (value array index)
   (ecase (%object-tag array)
@@ -211,9 +268,263 @@
      (setf (%object-ref-signed-byte-64 array index)
            value))
     (#.+object-tag-array-single-float+
-     (check-type value single-float)
-     (setf (%object-ref-unsigned-byte-32 array index)
-           (%single-float-as-integer value)))))
+     (setf (%object-ref-single-float array index)
+           value))
+    (#.+object-tag-array-double-float+
+     (setf (%object-ref-double-float array index)
+           value))
+    (#.+object-tag-array-complex-single-float+
+     (setf (%object-ref-single-float array (* index 2)) (realpart value)
+           (%object-ref-single-float array (1+ (* index 2))) (imagpart value)))
+    (#.+object-tag-array-complex-double-float+
+     (setf (%object-ref-double-float array (* index 2)) (realpart value)
+           (%object-ref-double-float array (1+ (* index 2))) (imagpart value))))
+  value)
+
+(defun (cas %simple-array-aref) (old new array index)
+  (ecase (%object-tag array)
+    (#.+object-tag-array-t+ ;; simple-vector
+     (cas (%object-ref-t array index) old new))
+    (#.+object-tag-array-fixnum+
+     (check-type old fixnum)
+     (check-type new fixnum)
+     (cas (%object-ref-t array index) old new))
+    ((#.+object-tag-array-bit+
+      #.+object-tag-array-unsigned-byte-2+
+      #.+object-tag-array-unsigned-byte-4+
+      #.+object-tag-array-signed-byte-1+
+      #.+object-tag-array-signed-byte-2+
+      #.+object-tag-array-signed-byte-4+)
+     ;; ### These could be supported with a RMW CAS loop, but it's not really worth it.
+     (error "CAS not supported on sub-octet arrays"))
+    (#.+object-tag-array-unsigned-byte-8+
+     (cas (%object-ref-unsigned-byte-8 array index) old new))
+    (#.+object-tag-array-unsigned-byte-16+
+     (cas (%object-ref-unsigned-byte-16 array index) old new))
+    (#.+object-tag-array-unsigned-byte-32+
+     (cas (%object-ref-unsigned-byte-32 array index) old new))
+    (#.+object-tag-array-unsigned-byte-64+
+     (cas (%object-ref-unsigned-byte-64 array index) old new))
+    (#.+object-tag-array-signed-byte-8+
+     (cas (%object-ref-signed-byte-8 array index) old new))
+    (#.+object-tag-array-signed-byte-16+
+     (cas (%object-ref-signed-byte-16 array index) old new))
+    (#.+object-tag-array-signed-byte-32+
+     (cas (%object-ref-signed-byte-32 array index) old new))
+    (#.+object-tag-array-signed-byte-64+
+     (cas (%object-ref-signed-byte-64 array index) old new))
+    (#.+object-tag-array-single-float+
+     (cas (%object-ref-single-float array index) old new))
+    (#.+object-tag-array-double-float+
+     (cas (%object-ref-double-float array index) old new))
+    ((#.+object-tag-array-complex-single-float+
+      #.+object-tag-array-complex-double-float+)
+     ;; ### (complex single) needs to do a 64-bit CAS, (complex double) needs 128-bit.
+     (error "CAS not supported on complex float arrays"))))
+
+(defun %memory-array-aref (array index)
+  (let ((address (%complex-array-storage array)))
+    (ecase (%complex-array-info array)
+      ((#.+object-tag-array-t+
+        #.+object-tag-array-fixnum+)
+       (memref-t address index))
+      (#.+object-tag-array-bit+
+       (multiple-value-bind (offset bit)
+           (truncate index 8)
+         (ldb (byte 1 bit)
+              (memref-unsigned-byte-8 address offset))))
+      (#.+object-tag-array-unsigned-byte-2+
+       (multiple-value-bind (offset bit)
+           (truncate index 4)
+         (ldb (byte 2 (* bit 2))
+              (memref-unsigned-byte-8 address offset))))
+      (#.+object-tag-array-unsigned-byte-4+
+       (multiple-value-bind (offset bit)
+           (truncate index 2)
+         (ldb (byte 4 (* bit 4))
+              (memref-unsigned-byte-8 address offset))))
+      (#.+object-tag-array-unsigned-byte-8+
+       (memref-unsigned-byte-8 address index))
+      (#.+object-tag-array-unsigned-byte-16+
+       (memref-unsigned-byte-16 address index))
+      (#.+object-tag-array-unsigned-byte-32+
+       (memref-unsigned-byte-32 address index))
+      (#.+object-tag-array-unsigned-byte-64+
+       (memref-unsigned-byte-64 address index))
+      (#.+object-tag-array-signed-byte-1+
+       (multiple-value-bind (offset bit)
+           (truncate index 8)
+         (sign-extend (ldb (byte 1 bit)
+                           (memref-unsigned-byte-8 address offset))
+                      1)))
+      (#.+object-tag-array-signed-byte-2+
+       (multiple-value-bind (offset bit)
+           (truncate index 4)
+         (sign-extend (ldb (byte 2 (* bit 2))
+                           (memref-unsigned-byte-8 address offset))
+                      2)))
+      (#.+object-tag-array-signed-byte-4+
+       (multiple-value-bind (offset bit)
+           (truncate index 2)
+         (sign-extend (ldb (byte 4 (* bit 4))
+                           (memref-unsigned-byte-8 address offset))
+                      4)))
+      (#.+object-tag-array-signed-byte-8+
+       (memref-signed-byte-8 address index))
+      (#.+object-tag-array-signed-byte-16+
+       (memref-signed-byte-16 address index))
+      (#.+object-tag-array-signed-byte-32+
+       (memref-signed-byte-32 address index))
+      (#.+object-tag-array-signed-byte-64+
+       (memref-signed-byte-64 address index))
+      (#.+object-tag-array-single-float+
+       (memref-single-float address index))
+      (#.+object-tag-array-double-float+
+       (memref-double-float address index))
+      (#.+object-tag-array-complex-single-float+
+       (complex
+        (memref-single-float address (* index 2))
+        (memref-single-float address (1+ (* index 2)))))
+      (#.+object-tag-array-complex-double-float+
+       (complex
+        (memref-double-float address (* index 2))
+        (memref-double-float address (1+ (* index 2))))))))
+
+(defun (setf %memory-array-aref) (value array index)
+  (let ((address (%complex-array-storage array)))
+    (ecase (%complex-array-info array)
+      (#.+object-tag-array-t+ ;; simple-vector
+       (setf (memref-t address index) value))
+      (#.+object-tag-array-fixnum+
+       (check-type value fixnum)
+       (setf (memref-t address index) value))
+      (#.+object-tag-array-bit+
+       (check-type value bit)
+       (multiple-value-bind (offset bit)
+           (truncate index 8)
+         (setf (ldb (byte 1 bit)
+                    (memref-unsigned-byte-8 address offset))
+               value)))
+      (#.+object-tag-array-unsigned-byte-2+
+       (check-type value (unsigned-byte 2))
+       (multiple-value-bind (offset bit)
+           (truncate index 4)
+         (setf (ldb (byte 2 (* bit 2))
+                    (memref-unsigned-byte-8 address offset))
+               value)))
+      (#.+object-tag-array-unsigned-byte-4+
+       (check-type value (unsigned-byte 4))
+       (multiple-value-bind (offset bit)
+           (truncate index 2)
+         (setf (ldb (byte 4 (* bit 4))
+                    (memref-unsigned-byte-8 address offset))
+               value)))
+      (#.+object-tag-array-unsigned-byte-8+
+       (setf (memref-unsigned-byte-8 address index)
+             value))
+      (#.+object-tag-array-unsigned-byte-16+
+       (setf (memref-unsigned-byte-16 address index)
+             value))
+      (#.+object-tag-array-unsigned-byte-32+
+       (setf (memref-unsigned-byte-32 address index)
+             value))
+      (#.+object-tag-array-unsigned-byte-64+
+       (setf (memref-unsigned-byte-64 address index)
+             value))
+      (#.+object-tag-array-signed-byte-1+
+       (check-type value (signed-byte 1))
+       (multiple-value-bind (offset bit)
+           (truncate index 8)
+         (setf (ldb (byte 1 bit)
+                    (memref-unsigned-byte-8 address offset))
+               (ldb (byte 1 0) value))))
+      (#.+object-tag-array-signed-byte-2+
+       (check-type value (signed-byte 2))
+       (multiple-value-bind (offset bit)
+           (truncate index 4)
+         (setf (ldb (byte 2 (* bit 2))
+                    (memref-unsigned-byte-8 address offset))
+               (ldb (byte 2 0) value))))
+      (#.+object-tag-array-signed-byte-4+
+       (check-type value (signed-byte 4))
+       (multiple-value-bind (offset bit)
+           (truncate index 2)
+         (setf (ldb (byte 4 (* bit 4))
+                    (memref-unsigned-byte-8 address offset))
+               (ldb (byte 4 0) value))))
+      (#.+object-tag-array-signed-byte-8+
+       (setf (memref-signed-byte-8 address index)
+             value))
+      (#.+object-tag-array-signed-byte-16+
+       (setf (memref-signed-byte-16 address index)
+             value))
+      (#.+object-tag-array-signed-byte-32+
+       (setf (memref-signed-byte-32 address index)
+             value))
+      (#.+object-tag-array-signed-byte-64+
+       (setf (memref-signed-byte-64 address index)
+             value))
+      (#.+object-tag-array-single-float+
+       (setf (memref-single-float address index)
+             value))
+      (#.+object-tag-array-double-float+
+       (setf (memref-double-float address index)
+             value))
+      (#.+object-tag-array-complex-single-float+
+       (setf (memref-single-float address (* index 2)) (realpart value)
+             (memref-single-float address (1+ (* index 2))) (imagpart value)))
+      (#.+object-tag-array-complex-double-float+
+       (setf (memref-double-float address (* index 2)) (realpart value)
+             (memref-double-float address (1+ (* index 2))) (imagpart value)))))
+  value)
+
+(defun (cas %memory-array-aref) (old new array index)
+  (let ((address (%complex-array-storage array)))
+    (ecase (%complex-array-info array)
+      (#.+object-tag-array-t+ ;; simple-vector
+       (cas (memref-t address index) old new))
+      (#.+object-tag-array-fixnum+
+       (check-type old fixnum)
+       (check-type new fixnum)
+       (cas (memref-t address index) old new))
+      ((#.+object-tag-array-bit+
+        #.+object-tag-array-unsigned-byte-2+
+        #.+object-tag-array-unsigned-byte-4+
+        #.+object-tag-array-signed-byte-1+
+        #.+object-tag-array-signed-byte-2+
+        #.+object-tag-array-signed-byte-4+)
+       ;; ### These could be supported with a RMW CAS loop, but it's not really worth it.
+       (error "CAS not supported on sub-octet arrays"))
+      (#.+object-tag-array-unsigned-byte-8+
+       (cas (memref-unsigned-byte-8 address index) old new))
+      (#.+object-tag-array-unsigned-byte-16+
+       (cas (memref-unsigned-byte-16 address index) old new))
+      (#.+object-tag-array-unsigned-byte-32+
+       (cas (memref-unsigned-byte-32 address index) old new))
+      (#.+object-tag-array-unsigned-byte-64+
+       (cas (memref-unsigned-byte-64 address index) old new))
+      (#.+object-tag-array-signed-byte-8+
+       (cas (memref-signed-byte-8 address index) old new))
+      (#.+object-tag-array-signed-byte-16+
+       (cas (memref-signed-byte-16 address index) old new))
+      (#.+object-tag-array-signed-byte-32+
+       (cas (memref-signed-byte-32 address index) old new))
+      (#.+object-tag-array-signed-byte-64+
+       (cas (memref-signed-byte-64 address index) old new))
+      (#.+object-tag-array-single-float+
+       (cas (memref-single-float address index) old new))
+      (#.+object-tag-array-double-float+
+       (cas (memref-double-float address index) old new))
+      ((#.+object-tag-array-complex-single-float+
+        #.+object-tag-array-complex-double-float+)
+       ;; ### (complex single) needs to do a 64-bit CAS, (complex double) needs 128-bit.
+       (error "CAS not supported on complex float arrays")))))
 
 (defun %simple-array-element-type (array)
   (svref *array-types* (%object-tag array)))
+
+(defun %simple-array-info (array)
+  (dolist (info *array-info*
+           (error "~S isn't a simple array?" array))
+    (when (%object-of-type-p array (specialized-array-definition-tag info))
+      (return info))))

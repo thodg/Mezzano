@@ -8,6 +8,7 @@
                 #:mouse-x-position #:mouse-y-position
                 #:mouse-button-state #:mouse-button-change)
   (:export #:default-damage-function
+           #:default-cursor-function
            #:frame
            #:frame-title
            #:close-button-p
@@ -17,13 +18,19 @@
            #:close-button-clicked
            #:draw-frame
            #:frame-size
+           #:resize-frame
            #:text-widget
+           #:resize-text-widget
            #:reset
-           #:cursor-visible))
+           #:cursor-visible
+           #:in-frame-header-p
+           #:in-frame-border-p
+           #:set-cursor-function))
 
 (in-package :mezzano.gui.widgets)
 
 (defgeneric draw-frame (frame))
+(defgeneric resize-frame (frame new-framebuffer))
 (defgeneric frame-size (frame))
 (defgeneric frame-mouse-event (frame mouse-event))
 (defgeneric reset (object))
@@ -32,16 +39,38 @@
   (lambda (&rest args)
     (apply #'mezzano.gui.compositor:damage-window window args)))
 
+(defun default-cursor-function (window)
+  (lambda (cursor)
+    (mezzano.gui.compositor:set-window-data window :cursor cursor)))
+
 (define-condition close-button-clicked () ())
 
 (defclass frame ()
-  ((%framebuffer :initarg :framebuffer :reader framebuffer)
+  ((%framebuffer :initarg :framebuffer :initform NIL :reader framebuffer)
    (%damage-function :initarg :damage-function :reader damage-function)
+   (%set-cursor-function :initarg :set-cursor-function :reader set-cursor-function)
    (%title :initarg :title :accessor frame-title)
+   (%title-width           :accessor title-width)
+   (%title-origin          :accessor title-origin)
+   (%title-vert            :accessor title-vert)
    (%close-button-p :initarg :close-button-p :accessor close-button-p)
    (%close-button-hover :initarg :close-button-hover :accessor close-button-hover)
-   (%activep :initarg :activep :accessor activep))
-  (:default-initargs :title "" :close-button-p nil :close-button-hover nil :activep nil))
+   (%close-vert            :accessor close-vert)
+   (%activep :initarg :activep :accessor activep)
+   (%resizablep :initarg :resizablep :accessor resizablep)
+   (%left   :initarg :left   :initform  1 :accessor left-border)
+   (%right  :initarg :right  :initform  1 :accessor right-border)
+   (%top    :initarg :top    :initform 19 :accessor top-border)
+   (%bottom :initarg :bottom :initform  1 :accessor bottom-border)
+   (%draw-corners-p                       :accessor draw-corners-p)
+   (%draw-close-button-p                  :accessor draw-close-button-p)
+   (%draw-title-p                         :accessor draw-title-p))
+  (:default-initargs
+    :title ""
+    :close-button-p nil
+    :close-button-hover nil
+    :activep nil
+    :resizablep nil))
 
 (defvar *frame-title-font* (open-font *default-font* *default-font-size*))
 
@@ -93,7 +122,6 @@
     '(unsigned-byte 32))))
 
 (defvar *close-button-x* 5)
-(defvar *close-button-y* 3)
 
 (defun lerp (v0 v1 a)
   (+ v0 (* (- v1 v0) a)))
@@ -129,64 +157,98 @@
 
 (defvar *frame-title-text-colour* (mezzano.gui:make-colour-from-octets #x3F #x3F #x3F))
 
-(defmethod draw-frame ((frame frame))
-  (let* ((framebuffer (framebuffer frame))
-         (win-width (mezzano.gui:surface-width framebuffer))
-         (win-height (mezzano.gui:surface-height framebuffer))
-         (title (frame-title frame))
-         (colour (if (activep frame) *active-frame-colour* *inactive-frame-colour*))
-         (top-colour (if (activep frame) *active-frame-top-colour* *inactive-frame-top-colour*)))
-    ;; Top.
-    (vertical-gradient win-width 19
-                       top-colour colour
-                       framebuffer 0 0)
-    ;; Bottom.
-    (mezzano.gui:bitset :set
-                        win-width 1
-                        colour
-                        framebuffer 0 (1- win-height))
-    ;; Left.
-    (mezzano.gui:bitset :set
-                        1 win-height
-                        colour
-                        framebuffer 0 19)
-    ;; Right.
-    (mezzano.gui:bitset :set
-                        1 win-height
-                        colour
-                        framebuffer (1- win-width) 19)
-    ;; Round off the corners.
-    (dotimes (y (array-dimension *corner-mask* 0))
-      (let ((line-colour (lerp-colour top-colour colour (/ y 19))))
-        (dotimes (x (array-dimension *corner-mask* 1))
-          (let* ((alpha (aref *corner-mask* y x))
-                 (real-colour (mezzano.gui:make-colour (* (mezzano.gui:colour-red line-colour)   alpha)
-                                                       (* (mezzano.gui:colour-green line-colour) alpha)
-                                                       (* (mezzano.gui:colour-blue line-colour)  alpha)
-                                                       (* (mezzano.gui:colour-alpha line-colour) alpha)
-                                                       t)))
-            (setf (mezzano.gui:surface-pixel framebuffer x y) real-colour
-                  (mezzano.gui:surface-pixel framebuffer (- win-width x 1) y) real-colour)))))
-    ;; Close button.
-    (when (close-button-p frame)
-      (mezzano.gui:bitblt :blend
-                          (mezzano.gui:surface-width *close-button*) (mezzano.gui:surface-height *close-button*)
-                          (if (close-button-hover frame) *close-button-hover* *close-button*)
-                          0 0
-                          framebuffer *close-button-x* *close-button-y*))
-    ;; Title.
-    (when title
+(defun set-frame-draw-enables (frame)
+  (let ((top-border (top-border frame))
+        (win-width (mezzano.gui:surface-width (framebuffer frame)))
+        (title (frame-title frame)))
+    (setf (draw-corners-p frame)
+          (and (>= top-border (array-dimension *corner-mask* 0))
+               (>= win-width (array-dimension *corner-mask* 1)))
+          (draw-close-button-p frame)
+          (and (close-button-p frame)
+               (>= top-border (+ (mezzano.gui:surface-height *close-button*) 4))
+               (>= win-width (+ (mezzano.gui:surface-width *close-button*)
+                                *close-button-x*)))
+          (close-vert frame)
+          (truncate (/ (- top-border (mezzano.gui:surface-height *close-button*))
+                       2))
+          (draw-title-p frame)
+          (and title (>= top-border (+ 4 (line-height *frame-title-font*)))))
+    (when (draw-title-p frame)
       (let ((width 0))
-        ;; How wide is the title text?
+        ;; Compute title width and height
         (dotimes (i (length title))
           (incf width (glyph-advance (character-to-glyph *frame-title-font* (char title i)))))
         ;; Clamp it, corner elements and buttons.
         (setf width (mezzano.gui:clamp width 0 (- win-width (+ 16 (* (array-dimension *corner-mask* 1) 2)))))
         ;; Find leftmost position.
-        (let ((origin (- (truncate win-width 2) (truncate width 2)))
-              (pen 0))
+        (setf (title-width frame) width
+              (title-origin frame) (- (truncate win-width 2) (truncate width 2))
+              (title-vert frame) (truncate (/ (- top-border (line-height *frame-title-font*)) 2)))))))
+
+(defmethod initialize-instance :after ((frame frame) &key)
+  (when (framebuffer frame)
+    (set-frame-draw-enables frame)))
+
+(defmethod draw-frame ((frame frame))
+  (let* ((framebuffer (framebuffer frame))
+         (win-width (mezzano.gui:surface-width framebuffer))
+         (win-height (mezzano.gui:surface-height framebuffer))
+         (left (left-border frame))
+         (right (right-border frame))
+         (top (top-border frame))
+         (bottom (bottom-border frame))
+         (colour (if (activep frame) *active-frame-colour* *inactive-frame-colour*))
+         (top-colour (if (activep frame) *active-frame-top-colour* *inactive-frame-top-colour*)))
+    ;; Top.
+    (vertical-gradient win-width top
+                       top-colour colour
+                       framebuffer 0 0)
+    ;; Bottom.
+    (mezzano.gui:bitset :set
+                        win-width bottom
+                        colour
+                        framebuffer 0 (- win-height bottom))
+    ;; Left.
+    (mezzano.gui:bitset :set
+                        left win-height
+                        colour
+                        framebuffer 0 top)
+    ;; Right.
+    (mezzano.gui:bitset :set
+                        right win-height
+                        colour
+                        framebuffer (- win-width right) top)
+    (when (draw-corners-p frame)
+      ;; Round off the corners
+      (dotimes (y (array-dimension *corner-mask* 0))
+        (let ((line-colour (lerp-colour top-colour colour (/ y 19))))
+          (dotimes (x (array-dimension *corner-mask* 1))
+            (let* ((alpha (aref *corner-mask* y x))
+                   (real-colour (mezzano.gui:make-colour
+                                 (* (mezzano.gui:colour-red line-colour)   alpha)
+                                 (* (mezzano.gui:colour-green line-colour) alpha)
+                                 (* (mezzano.gui:colour-blue line-colour)  alpha)
+                                 (* (mezzano.gui:colour-alpha line-colour) alpha)
+                                 t)))
+              (setf (mezzano.gui:surface-pixel framebuffer x y) real-colour
+                    (mezzano.gui:surface-pixel framebuffer (- win-width x 1) y) real-colour))))))
+    (when (draw-close-button-p frame)
+      ;; Close button.
+      (mezzano.gui:bitblt :blend
+                          (mezzano.gui:surface-width *close-button*) (mezzano.gui:surface-height *close-button*)
+                          (if (close-button-hover frame) *close-button-hover* *close-button*)
+                          0 0
+                          framebuffer *close-button-x* (close-vert frame)))
+    (when (draw-title-p frame)
+      ;; Title.
+      (let ((title (frame-title frame))
+            (origin (title-origin frame))
+            (width (title-width frame))
+            (vert (title-vert frame))
+            (pen 0))
           ;; Write characters.
-          (dotimes (i (length title))
+        (dotimes (i (length title))
             (let* ((glyph (character-to-glyph *frame-title-font* (char title i)))
                    (mask (glyph-mask glyph)))
               (when (> pen width)
@@ -196,31 +258,95 @@
                                   *frame-title-text-colour*
                                   framebuffer
                                   (+ origin pen (glyph-xoff glyph))
-                                  (- (+ 4 (ascender *frame-title-font*)) (glyph-yoff glyph))
+                                  (- (+ vert (ascender *frame-title-font*)) (glyph-yoff glyph))
                                   mask 0 0)
-              (incf pen (glyph-advance glyph)))))))
+              (incf pen (glyph-advance glyph))))))
     ;; Damage the whole window.
     (funcall (damage-function frame) 0 0 win-width win-height)))
 
+(defmethod resize-frame ((frame frame) new-framebuffer)
+  (setf (slot-value frame '%framebuffer) new-framebuffer)
+  (set-frame-draw-enables frame)
+  (draw-frame frame))
+
 (defmethod frame-size ((frame frame))
   ;; left, right, top, bottom.
-  (values 1 1 19 1))
+  (with-slots (%left %right %top %bottom) frame
+    (values %left %right %top %bottom)))
 
 (defun in-frame-close-button (frame x y)
-  (and (close-button-p frame)
-       (>= x *close-button-x*)
-       (< x (+ *close-button-x* (mezzano.gui:surface-width *close-button*)))
-       (>= y *close-button-y*)
-       (< y (+ *close-button-y* (mezzano.gui:surface-height *close-button*)))
-       ;; Alpha test.
-       (> (mezzano.gui:colour-alpha
-           (mezzano.gui:surface-pixel *close-button* (- x *close-button-x*) (- y *close-button-y*)))
-          0.5)))
+  (let ((close-button-y (close-vert frame)))
+    (and (close-button-p frame)
+         (>= x *close-button-x*)
+         (< x (+ *close-button-x* (mezzano.gui:surface-width *close-button*)))
+         (>= y close-button-y)
+         (< y (+ close-button-y (mezzano.gui:surface-height *close-button*)))
+         ;; Alpha test.
+         (> (mezzano.gui:colour-alpha
+             (mezzano.gui:surface-pixel *close-button*
+                                        (- x *close-button-x*)
+                                        (- y close-button-y)))
+            0.5))))
+
+(defun in-frame-header-p (frame x y)
+  (declare (ignore x))
+  (< y (top-border frame)))
+
+(defparameter *border-thickness* 3)
+(defparameter *border-corner-size* 10)
+
+(defun in-frame-border-p (frame x y)
+  (let* ((framebuffer (framebuffer frame))
+         (win-width (mezzano.gui:surface-width framebuffer))
+         (win-height (mezzano.gui:surface-height framebuffer)))
+    (labels ((near (coord size dist)
+               (declare (ignore size))
+               (< coord dist))
+             (far (coord size dist)
+               (>= coord (- size dist)))
+             (corner (x y width-fn height-fn)
+               (or
+                (and (funcall width-fn x win-width *border-thickness*)
+                     (funcall height-fn y win-height *border-corner-size*))
+                (and (funcall height-fn y win-height *border-thickness*)
+                     (funcall width-fn x win-width *border-corner-size*)))))
+      (cond
+        ;; Corners first.
+        ((corner x y #'near #'near)
+         :top-left)
+        ((corner x y #'far #'near)
+         :top-right)
+        ((corner x y #'far #'far)
+         :bottom-right)
+        ((corner x y #'near #'far)
+         :bottom-left)
+        ((near x win-width *border-thickness*)
+         :left)
+        ((far x win-width *border-thickness*)
+         :right)
+        ((near y win-height *border-thickness*)
+         :top)
+        ((far y win-height *border-thickness*)
+         :bottom)))))
+
+(defun border-to-cursor (border)
+  (case border
+    (:top-left     :arrow-up-left)
+    (:top-right    :arrow-up-right)
+    (:bottom-right :arrow-down-right)
+    (:bottom-left  :arrow-down-left)
+    (:left         :arrow-left)
+    (:right        :arrow-right)
+    (:top          :arrow-up)
+    (:bottom       :arrow-down)
+    (t             :default)))
 
 (defmethod frame-mouse-event ((frame frame) event)
   (cond ((in-frame-close-button frame
                                 (mouse-x-position event)
                                 (mouse-y-position event))
+         (when (resizablep frame)
+           (funcall (set-cursor-function frame) :default))
          (when (not (close-button-hover frame))
            (setf (close-button-hover frame) t)
            (draw-frame frame)
@@ -232,14 +358,40 @@
                     ;; Mouse1 up
                     (not (logbitp 0 (mouse-button-state event))))
            (signal 'close-button-clicked)))
-        ((close-button-hover frame)
-         (setf (close-button-hover frame) nil)
-         (draw-frame frame)
-         (funcall (damage-function frame)
-                  0 0
-                  (mezzano.gui:surface-width (framebuffer frame)) 19))))
+        (t
+         (when (close-button-hover frame)
+           (setf (close-button-hover frame) nil)
+           (draw-frame frame)
+           (funcall (damage-function frame)
+                    0 0
+                    (mezzano.gui:surface-width (framebuffer frame)) 19))
+         ;; Check for drag start.
+         (let ((border (in-frame-border-p frame
+                                          (mouse-x-position event)
+                                          (mouse-y-position event)))
+               (win (mezzano.gui.compositor:window event)))
+           (when (resizablep frame)
+             (funcall (set-cursor-function frame)
+                      (if border
+                          (border-to-cursor border)
+                          :default)))
+           (cond ((not win))
+                 ((not (and (logbitp 0 (mouse-button-change event))
+                            ;; Mouse1 down
+                            (logbitp 0 (mouse-button-state event)))))
+                 ((and (resizablep frame)
+                       border)
+                  (mezzano.gui.compositor:begin-window-drag
+                   win
+                   :mode border))
+                 ((in-frame-header-p frame
+                                     (mouse-x-position event)
+                                     (mouse-y-position event))
+                  (mezzano.gui.compositor:begin-window-drag
+                   win
+                   :mode :move)))))))
 
-(defclass text-widget (sys.gray:fundamental-character-output-stream)
+(defclass text-widget (mezzano.gray:fundamental-character-output-stream)
   ((%framebuffer :initarg :framebuffer :reader framebuffer)
    (%x-position :initarg :x-position :reader x-position)
    (%y-position :initarg :y-position :reader y-position)
@@ -257,7 +409,7 @@
   (:default-initargs :foreground-colour mezzano.gui:*default-foreground-colour*
                      :background-colour mezzano.gui:*default-background-colour*))
 
-(defmethod initialize-instance :after ((widget text-widget) &key &allow-other-keys)
+(defmethod initialize-instance :after ((widget text-widget) &key)
   (reset widget))
 
 (defgeneric (setf cursor-visible) (value object))
@@ -296,7 +448,7 @@
          (when ,state
            (setf (cursor-visible ,stream-sym) t))))))
 
-(defmethod sys.gray:stream-terpri ((stream text-widget))
+(defmethod mezzano.gray:stream-terpri ((stream text-widget))
   (with-cursor-hidden (stream)
     (let* ((x (cursor-x stream))
            (y (cursor-y stream))
@@ -338,10 +490,10 @@
                                    fb left (+ top y))
                (funcall (damage-function stream) left (+ top y) win-width line-height))))))
 
-(defmethod sys.gray:stream-write-char ((stream text-widget) character)
+(defmethod mezzano.gray:stream-write-char ((stream text-widget) character)
   (cond
     ((eql character #\Newline)
-     (sys.gray:stream-terpri stream))
+     (mezzano.gray:stream-terpri stream))
     (t (with-cursor-hidden (stream)
          (let* ((glyph (character-to-glyph (font stream) character))
                 (mask (glyph-mask glyph))
@@ -352,7 +504,7 @@
                 (left (x-position stream))
                 (top (y-position stream)))
            (when (> (+ (cursor-x stream) advance) win-width)
-             (sys.gray:stream-terpri stream))
+             (mezzano.gray:stream-terpri stream))
            ;; Fetch x/y after terpri.
            (let ((x (cursor-x stream))
                  (y (cursor-y stream)))
@@ -371,43 +523,40 @@
              (incf (cursor-x stream) advance)
              (incf (cursor-column stream))))))))
 
-(defmethod sys.gray:stream-start-line-p ((stream text-widget))
+(defmethod mezzano.gray:stream-start-line-p ((stream text-widget))
   (zerop (cursor-x stream)))
 
-(defmethod sys.gray:stream-line-column ((stream text-widget))
+(defmethod mezzano.gray:stream-line-column ((stream text-widget))
   (cursor-column stream))
 
-(defmethod sys.int::stream-cursor-pos ((stream text-widget))
+(defmethod mezzano.internals::stream-cursor-pos ((stream text-widget))
   (values (cursor-x stream)
           (+ (cursor-line stream)
              (cursor-y stream))))
 
-(defmethod sys.int::stream-move-to ((stream text-widget) x y)
+(defmethod mezzano.internals::stream-move-to ((stream text-widget) x y)
   (check-type x integer)
   (check-type y integer)
   (with-cursor-hidden (stream)
     (setf (cursor-x stream) x
           (cursor-y stream) (max (- y (cursor-line stream)) 0))))
 
-(defmethod sys.int::stream-character-width ((stream text-widget) character)
+(defmethod mezzano.internals::stream-character-width ((stream text-widget) character)
   (glyph-advance (character-to-glyph (font stream) character)))
 
-(defmethod sys.int::stream-compute-motion ((stream text-widget) string &optional (start 0) end initial-x initial-y)
+(defmethod mezzano.internals::stream-compute-motion ((stream text-widget) string &optional (start 0) end initial-x initial-y)
   (unless end (setf end (length string)))
   (unless initial-x (setf initial-x (cursor-x stream)))
   (unless initial-y (setf initial-y (+ (cursor-line stream)
                                        (cursor-y stream))))
-  (do* ((framebuffer (framebuffer stream))
-        (win-width (width stream))
+  (do* ((win-width (width stream))
         (win-height (height stream))
         (line-height (line-height (font stream)))
-        (left (x-position stream))
-        (top (y-position stream))
         (i start (1+ i)))
        ((>= i end)
         (values initial-x initial-y))
     (let* ((ch (char string i))
-           (advance (sys.int::stream-character-width stream ch)))
+           (advance (mezzano.internals::stream-character-width stream ch)))
       (when (or (eql ch #\Newline)
                 (> (+ initial-x advance) win-width))
         (setf initial-x 0
@@ -417,11 +566,10 @@
       (unless (eql ch #\Newline)
         (incf initial-x advance)))))
 
-(defmethod sys.int::stream-clear-between ((stream text-widget) start-x start-y end-x end-y)
+(defmethod mezzano.internals::stream-clear-between ((stream text-widget) start-x start-y end-x end-y)
   (with-cursor-hidden (stream)
     (let* ((framebuffer (framebuffer stream))
            (win-width (width stream))
-           (win-height (height stream))
            (colour (background-colour stream))
            (line-height (line-height (font stream)))
            (left (x-position stream))
@@ -455,6 +603,93 @@
                                  colour
                                  framebuffer left (+ top end-y))
              (funcall (damage-function stream) left (+ top end-y) end-x line-height))))))
+
+(defun align-down (value alignment)
+  (- value (rem value alignment)))
+
+(defmethod mezzano.gray:stream-display ((stream text-widget) (object mezzano.gui:surface))
+  (with-cursor-hidden (stream)
+    (let* ((framebuffer (framebuffer stream))
+           (win-width (width stream))
+           (win-height (height stream))
+           (line-height (line-height (font stream)))
+           (left (x-position stream))
+           (top (y-position stream)))
+      (cond ((> (mezzano.gui:surface-height object) line-height)
+             ;; Object exceeds the height of a line, render it on it's own line.
+             (let ((n-lines (ceiling (mezzano.gui:surface-height object) line-height)))
+               (fresh-line stream)
+               ;; Make space.
+               (dotimes (i (1- n-lines))
+                 (terpri stream))
+               ;; Draw.
+               (let* ((draw-width (min win-width (mezzano.gui:surface-width object)))
+                      (draw-height (min (align-down win-height line-height)
+                                        (mezzano.gui:surface-height object)))
+                      (ypos (- (+ top (cursor-y stream) line-height) draw-height)))
+                 (mezzano.gui:bitblt :blend draw-width draw-height
+                                     object
+                                     0
+                                     (- (mezzano.gui:surface-height object) draw-height)
+                                     framebuffer
+                                     left
+                                     ypos)
+                 (funcall (damage-function stream) left ypos draw-width draw-height)
+                 (setf (cursor-x stream) draw-width)
+                 (terpri stream))))
+            (t
+             ;; Fits on one line, render it like a character.
+             (let ((object-width (min win-width (mezzano.gui:surface-width object)))
+                   (object-height (mezzano.gui:surface-height object)))
+               (when (> (+ (cursor-x stream) object-width) win-width)
+                 (mezzano.gray:stream-terpri stream))
+               ;; Fetch x/y after terpri.
+               (let ((x (cursor-x stream))
+                     (y (cursor-y stream)))
+                 (mezzano.gui:bitset :set
+                                     object-width line-height
+                                     (background-colour stream)
+                                     framebuffer (+ left x) (+ top y))
+                 (mezzano.gui:bitblt :blend
+                                     object-width object-height
+                                     object 0 0
+                                     framebuffer
+                                     (+ left x)
+                                     (+ top y (- line-height object-height)))
+                 (funcall (damage-function stream) (+ left x) (+ top y) object-width line-height)
+                 (incf (cursor-x stream) object-width)
+                 (incf (cursor-column stream)))))))))
+
+(defgeneric resize-text-widget (widget framebuffer x-position y-position width height))
+
+(defmethod resize-text-widget ((widget text-widget) framebuffer x-position y-position width height)
+  ;; Fill the new framebuffer with the background colour.
+  ;; The copy from the old framebuffer might not cover the entire new area.
+  (mezzano.gui:bitset :set
+                      width height
+                      (background-colour widget)
+                      framebuffer
+                      x-position y-position)
+  ;; Copy the old framebuffer to the new framebuffer,
+  ;; and adjust the cursor position to be within limits.
+  (let* ((y (cursor-y widget))
+         (line-height (line-height (font widget)))
+         (adjusted-y (min y (* (1- (truncate height line-height)) line-height)))
+         (y-delta (- y adjusted-y)))
+    (setf (cursor-y widget) adjusted-y)
+    (incf (cursor-line widget) y-delta)
+    (mezzano.gui:bitblt :set
+                        (min width (width widget)) (min height (- (height widget) y-delta))
+                        (framebuffer widget)
+                        (x-position widget) (+ (y-position widget) y-delta)
+                        framebuffer
+                        x-position y-position))
+  (setf (slot-value widget '%framebuffer) framebuffer
+        (slot-value widget '%x-position) x-position
+        (slot-value widget '%y-position) y-position
+        (slot-value widget '%width) width
+        (slot-value widget '%height) height)
+  (funcall (damage-function widget) (x-position widget) (y-position widget) (width widget) (height widget)))
 
 (defmethod reset ((widget text-widget))
   (setf (cursor-x widget) 0

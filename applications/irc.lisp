@@ -1,13 +1,15 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(defpackage :irc-client
-  (:use :cl :sys.net)
+(defpackage :mezzano.irc-client
+  (:use :split-sequence :cl :mezzano.network)
   (:export #:spawn))
 
-(in-package :irc-client)
+(in-package :mezzano.irc-client)
 
 (defvar *irc-history* (make-instance 'mezzano.line-editor:history-table))
+(defvar *irc-init-file* "SYS:HOME;IRC-INIT.lisp")
+(defvar *default-nick* "Mezzie")
 
 (defparameter *numeric-replies*
   '((401 :err-no-such-nick)
@@ -202,7 +204,7 @@
                    (subseq line (or rest-start (length line)) rest-end))))
         (t (values "say" line))))
 
-(defvar *command-table* (make-hash-table :test 'equal))
+(defvar *command-table* (make-hash-table :test 'equal :synchronized t))
 
 (defmacro define-server-command (name (state . lambda-list) &body body)
   (let ((args (gensym)))
@@ -211,7 +213,7 @@
                          name)
                     *command-table*)
            (lambda (,state ,(first lambda-list) ,args)
-             (declare (system:lambda-name (irc-command ,name)))
+             (declare (mezzano.internals::lambda-name (irc-command ,name)))
              (destructuring-bind ,(rest lambda-list) ,args
                ,@body)))))
 
@@ -303,8 +305,8 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
            (return))
          (mezzano.supervisor:fifo-push (make-instance 'server-line-event :line line) fifo)))))
 
-(defvar *top-level-commands* (make-hash-table :test 'equal))
-(defvar *top-level-command-doc* (make-hash-table :test 'equal))
+(defvar *top-level-commands* (make-hash-table :test 'equal :synchronized t))
+(defvar *top-level-command-doc* (make-hash-table :test 'equal :synchronized t))
 
 (defmacro define-command (name (irc text) docstring &body body)
   `(progn
@@ -314,7 +316,7 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
      (setf (gethash ',(string-upcase (string name))
                     *top-level-commands*)
            (lambda (,irc ,text)
-             (declare (system:lambda-name (irc-command ,name)))
+             (declare (mezzano.internals::lambda-name (irc-command ,name)))
              ,@body))))
 
 (define-command quit (irc text)
@@ -347,6 +349,14 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
          (buffered-format (irc-connection irc) "PRIVMSG ~A :~A~%"
                           (current-channel irc) text))
         (t (error "Not connected or not joined to a channel."))))
+
+(define-command msg (irc text)
+  "MSG <target> [message]
+   Send a message to or begin a conversation with the specified target."
+   (multiple-value-bind (split-text returned-index) (split-sequence #\Space text :start 0 :count 1)
+     (let ((leftovers (subseq text returned-index)))
+          (cond ((irc-connection irc)
+                 (buffered-format (irc-connection irc) "PRIVMSG ~A :~A~%" (elt split-text 0) leftovers))))))
 
 (define-command me (irc text)
   "ACTION <text>
@@ -447,6 +457,7 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
   ((%fifo :initarg :fifo :reader fifo)
    (%window :initarg :window :reader window)
    (%frame :initarg :frame :reader frame)
+   (%font :initarg :font :reader font)
    (%display-pane :initarg :display-pane :reader display-pane)
    (%input-pane :initarg :input-pane :reader input-pane)
    (%current-channel :initarg :current-channel :accessor current-channel)
@@ -457,11 +468,11 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
   (:default-initargs :current-channel nil :joined-channels '() :nickname nil :connection nil))
 
 (defclass irc-input-pane (mezzano.line-editor:line-edit-mixin
-                          sys.gray:fundamental-character-input-stream
+                          mezzano.gray:fundamental-character-input-stream
                           mezzano.gui.widgets:text-widget)
   ((%irc :initarg :irc :reader irc)))
 
-(defmethod sys.gray:stream-read-char ((stream irc-input-pane))
+(defmethod mezzano.gray:stream-read-char ((stream irc-input-pane))
   (let* ((irc (irc stream))
          (fifo (fifo irc)))
     (unwind-protect
@@ -491,6 +502,9 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
 (defmethod dispatch-event (irc (event mezzano.gui.compositor:window-close-event))
   (throw 'quit nil))
 
+(defmethod dispatch-event (irc (event mezzano.gui.compositor:quit-event))
+  (throw 'quit nil))
+
 (defmethod dispatch-event (irc (event mezzano.gui.compositor:key-event))
   ;; should filter out strange keys?
   (when (not (mezzano.gui.compositor:key-releasep event))
@@ -499,11 +513,12 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
           ;; Force character to uppercase when a modifier key is active, gets
           ;; around weirdness in how character names are processed.
           ;; #\C-a and #\C-A both parse as the same character (C-LATIN_CAPITAL_LETTER_A).
-          (sys.int::make-character (char-code (char-upcase (mezzano.gui.compositor:key-key event)))
-                                   :control (find :control (mezzano.gui.compositor:key-modifier-state event))
-                                   :meta (find :meta (mezzano.gui.compositor:key-modifier-state event))
-                                   :super (find :super (mezzano.gui.compositor:key-modifier-state event))
-                                   :hyper (find :hyper (mezzano.gui.compositor:key-modifier-state event)))
+          (mezzano.internals::make-character
+           (char-code (char-upcase (mezzano.gui.compositor:key-key event)))
+           :control (find :control (mezzano.gui.compositor:key-modifier-state event))
+           :meta (find :meta (mezzano.gui.compositor:key-modifier-state event))
+           :super (find :super (mezzano.gui.compositor:key-modifier-state event))
+           :hyper (find :hyper (mezzano.gui.compositor:key-modifier-state event)))
           (mezzano.gui.compositor:key-key event)))))
 
 (defmethod dispatch-event (irc (event server-disconnect-event))
@@ -530,19 +545,86 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
                (format (display-pane irc) "~&[~A] ~D ~A" prefix command parameters))
               (t (format (display-pane irc) "~&~A" line)))))))
 
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-request-event))
+  (let ((old-width (mezzano.gui.compositor:width (window app)))
+        (old-height (mezzano.gui.compositor:height (window app)))
+        (new-width (max 100 (mezzano.gui.compositor:width event)))
+        (new-height (max 100 (mezzano.gui.compositor:height event))))
+    (when (or (not (eql old-width new-width))
+              (not (eql old-height new-height)))
+      (let ((new-framebuffer (mezzano.gui:make-surface
+                              new-width new-height))
+            (frame (frame app))
+            (font (font app)))
+        (mezzano.gui.widgets:resize-frame (frame app) new-framebuffer)
+        (mezzano.gui.widgets:resize-text-widget (display-pane app)
+                                                new-framebuffer
+                                                (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+                                                (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+                                                (- new-width
+                                                   (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+                                                   (nth-value 1 (mezzano.gui.widgets:frame-size frame)))
+                                                (- new-height
+                                                   (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+                                                   (nth-value 3 (mezzano.gui.widgets:frame-size frame))
+                                                   1
+                                                   (mezzano.gui.font:line-height font)))
+        (mezzano.gui.widgets:resize-text-widget (input-pane app)
+                                                new-framebuffer
+                                                (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+                                                (+ (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+                                                   (- new-height
+                                                      (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+                                                      (nth-value 3 (mezzano.gui.widgets:frame-size frame))
+                                                      (mezzano.gui.font:line-height font)))
+                                                (- new-width
+                                                   (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+                                                   (nth-value 1 (mezzano.gui.widgets:frame-size frame)))
+                                                (mezzano.gui.font:line-height font))
+        (draw-seperating-line app new-width new-height new-framebuffer)
+        (mezzano.gui.compositor:resize-window
+         (window app) new-framebuffer
+         :origin (mezzano.gui.compositor:resize-origin event))))))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-event))
+  (reset-input app))
+
+(defun draw-seperating-line (irc width height framebuffer)
+  (let* ((frame (frame irc))
+         (font (font irc)))
+    ;; Line seperating display and input panes.
+    (mezzano.gui:bitset :set
+                        (- width
+                           (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+                           (nth-value 1 (mezzano.gui.widgets:frame-size frame)))
+                        1
+                        (mezzano.gui:make-colour 0.5 0.5 0.5)
+                        framebuffer
+                        (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+                        (+ (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+                           (- height
+                              (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+                              (nth-value 3 (mezzano.gui.widgets:frame-size frame))
+                              (mezzano.gui.font:line-height font)
+                              1)))))
+
 (defun irc-main ()
   (catch 'quit
     (let ((font (mezzano.gui.font:open-font
                  mezzano.gui.font:*default-monospace-font*
                  mezzano.gui.font:*default-monospace-font-size*))
           (fifo (mezzano.supervisor:make-fifo 50)))
+      (ignore-errors
+        (load *irc-init-file* :if-does-not-exist nil))
       (mezzano.gui.compositor:with-window (window fifo 640 480)
         (let* ((framebuffer (mezzano.gui.compositor:window-buffer window))
                (frame (make-instance 'mezzano.gui.widgets:frame
                                      :framebuffer framebuffer
                                      :title "IRC"
                                      :close-button-p t
-                                     :damage-function (mezzano.gui.widgets:default-damage-function window)))
+                                     :resizablep t
+                                     :damage-function (mezzano.gui.widgets:default-damage-function window)
+                                     :set-cursor-function (mezzano.gui.widgets:default-cursor-function window)))
                (display-pane (make-instance 'mezzano.gui.widgets:text-widget
                                             :font font
                                             :framebuffer framebuffer
@@ -576,24 +658,12 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
                                    :fifo fifo
                                    :window window
                                    :frame frame
+                                   :font font
                                    :display-pane display-pane
-                                   :input-pane input-pane)))
+                                   :input-pane input-pane
+				   :nickname *default-nick*)))
           (setf (slot-value input-pane '%irc) irc)
-          ;; Line seperating display and input panes.
-          (mezzano.gui:bitset :set
-                              (- (mezzano.gui.compositor:width window)
-                                   (nth-value 0 (mezzano.gui.widgets:frame-size frame))
-                                   (nth-value 1 (mezzano.gui.widgets:frame-size frame)))
-                              1
-                              (mezzano.gui:make-colour 0.5 0.5 0.5)
-                              framebuffer
-                              (nth-value 0 (mezzano.gui.widgets:frame-size frame))
-                              (+ (nth-value 2 (mezzano.gui.widgets:frame-size frame))
-                                 (- (mezzano.gui.compositor:height window)
-                                    (nth-value 2 (mezzano.gui.widgets:frame-size frame))
-                                    (nth-value 3 (mezzano.gui.widgets:frame-size frame))
-                                    (mezzano.gui.font:line-height font)
-                                    1)))
+          (draw-seperating-line irc (mezzano.gui.compositor:width window) (mezzano.gui.compositor:height window) framebuffer)
           (mezzano.gui.widgets:draw-frame frame)
           (mezzano.gui.compositor:damage-window window
                                                 0 0

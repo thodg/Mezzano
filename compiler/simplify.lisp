@@ -1,11 +1,13 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
+;;;; Copyright (c) 2011-2017 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
 ;;;; Simplifiy the ast by removing empty nodes and unused variables.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
-(defun simplify (lambda)
+(defun simplify (lambda architecture)
+  (declare (ignore architecture))
+  (detect-uses lambda)
   (simp-form lambda))
 
 (defgeneric simp-form (form))
@@ -13,7 +15,15 @@
 (defun simp-form-list (x)
   (do ((i x (cdr i)))
       ((endp i))
-    (setf (car i) (simp-form (car i)))))
+    (setf (car i) (cond ((and (typep (car i) 'ast-let)
+                              (typep (ast-body (car i)) 'ast-the))
+                         ;; Hoist the forms out of lets.
+                         (change-made)
+                         (ast `(the ,(the-type (ast-body (car i)))
+                                    ,(simp-form (car i)))
+                              (car i)))
+                        (t
+                         (simp-form (car i)))))))
 
 (defmethod simp-form ((form ast-block))
   (cond
@@ -21,10 +31,6 @@
     ((eql (lexical-variable-use-count (info form)) 0)
      (change-made)
      (simp-form (body form)))
-    ;; (block foo <constantish>) => 'nil
-    ((typep (body form) '(or ast-quote ast-function lexical-variable lambda-information))
-     (change-made)
-     (ast '(quote nil)))
     ;; (block foo (return-from foo form)) => (block foo form)
     ((and (typep (body form) 'ast-return-from)
           (eql (info form) (info (body form))))
@@ -52,14 +58,13 @@
   (let ((test-form (test form)))
     (typecase test-form
       (ast-let
-       (when (find-if (lambda (x) (typep x 'special-variable))
-                      (bindings test-form)
-                      :key #'first)
+       (when (let-binds-special-variable-p test-form)
          (return-from hoist-form-out-of-if nil))
        (ast `(let ,(bindings test-form)
                (if ,(body test-form)
                    ,(if-then form)
-                   ,(if-else form)))))
+                   ,(if-else form)))
+            form))
       (ast-multiple-value-bind
        (when (find-if (lambda (x) (typep x 'special-variable))
                       (bindings test-form))
@@ -68,13 +73,15 @@
                  ,(value-form test-form)
                (if ,(body test-form)
                    ,(if-then form)
-                   ,(if-else form)))))
+                   ,(if-else form)))
+            form))
       (ast-progn
        (if (forms test-form)
            (ast `(progn ,@(append (butlast (forms test-form))
                                   (list `(if ,(first (last (forms test-form)))
                                              ,(if-then form)
-                                             ,(if-else form))))))
+                                             ,(if-else form)))))
+                form)
            ;; No body forms, must evaluate to NIL!
            ;; Fold away the IF.
            (if-else form))))))
@@ -101,14 +108,21 @@
                                                   (go then-tag if-tagbody)
                                                   (go else-tag if-tagbody))))
                                    (then-tag (return-from if-escape ,(if-then form) if-escape))
-                                   (else-tag (return-from if-escape ,(if-else form) if-escape))))))))
+                                   (else-tag (return-from if-escape ,(if-else form) if-escape))))
+                             form))))
           ((and (typep (if-then form) 'ast-go)
                 (typep (if-else form) 'ast-go)
                 (eql (target (if-then form)) (target (if-else form)))
                 (eql (info (if-then form)) (info (if-else form))))
-           ;; Rewrite (if x (go A-TAG) (go A-TAG)) => (go A-TAG)
+           ;; Rewrite (if x (go A-TAG) (go A-TAG)) => (progn x (go A-TAG))
            (change-made)
-           (simp-form (if-then form)))
+           (simp-form (ast `(progn ,(test form) ,(if-then form))
+                           form)))
+          ((eql (if-then form) (if-else form))
+           ;; Rewrite (if x foo foo) => (progn x foo)
+           (change-made)
+           (simp-form (ast `(progn ,(test form) ,(if-then form))
+                           form)))
           ((typep (test form) 'ast-quote)
            ;; (if 'not-nil then else) => then
            ;; (if 'nil then else) => else
@@ -122,42 +136,86 @@
                  (if-else form) (simp-form (if-else form)))
            form))))
 
+(defun pure-p (form)
+  (let ((unwrapped (unwrap-the form)))
+    (or (lambda-information-p unwrapped)
+        (typep unwrapped 'ast-quote)
+        (typep unwrapped 'ast-function)
+        (and (lexical-variable-p unwrapped)
+             (localp unwrapped)
+             (eql (lexical-variable-write-count unwrapped) 0))
+        ;; FIXME: This needs to check the number of arguments.
+        (and (typep unwrapped 'ast-call)
+             (member (ast-name unwrapped) *pure-functions* :test #'equal)
+             (every #'pure-p (ast-arguments unwrapped))))))
+
 (defmethod simp-form ((form ast-let))
   ;; Merge nested LETs when possible, do not merge special bindings!
   (do ((nested-form (body form) (body form)))
-      ((or (not (typep nested-form 'ast-let))
-           (some (lambda (x) (typep x 'special-variable)) (mapcar 'first (bindings form)))
-	   (and (bindings nested-form)
-                (typep (first (first (bindings nested-form))) 'special-variable))))
+      ((or (not (typep (unwrap-the nested-form) 'ast-let))
+           (let-binds-special-variable-p form)
+           (and (bindings (unwrap-the nested-form))
+                (typep (first (first (bindings (unwrap-the nested-form)))) 'special-variable))))
     (change-made)
-    (if (null (bindings nested-form))
-	(setf (body form) (body nested-form))
-	(setf (bindings form) (nconc (bindings form) (list (first (bindings nested-form))))
-	      (bindings nested-form) (rest (bindings nested-form)))))
+    (if (null (bindings (unwrap-the nested-form)))
+        (setf (body form) (ast `(the ,(unwrapped-the-type nested-form)
+                                     ,(body (unwrap-the nested-form)))
+                               nested-form))
+        (setf (bindings form) (nconc (bindings form) (list (first (bindings (unwrap-the nested-form)))))
+              (bindings (unwrap-the nested-form)) (rest (bindings (unwrap-the nested-form))))))
   ;; Remove unused values with no side-effects.
   (setf (bindings form) (remove-if (lambda (b)
                                      (let ((var (first b))
                                            (val (second b)))
-                                       (and (lexical-variable-p var)
-                                            (or (lambda-information-p val)
-                                                (typep val 'ast-quote)
-                                                (typep val 'ast-function)
-                                                (and (lexical-variable-p val)
-                                                     (localp val)
-                                                     (eql (lexical-variable-write-count val) 0)))
-                                            (eql (lexical-variable-use-count var) 0)
-                                            (progn (change-made)
-                                                   t))))
+                                       (cond ((and (lexical-variable-p var)
+                                                   (pure-p val)
+                                                   (eql (lexical-variable-use-count var) 0))
+                                              (change-made)
+                                              t)
+                                             (t nil))))
                                    (bindings form)))
   (dolist (b (bindings form))
     (setf (second b) (simp-form (second b))))
+  (setf (body form) (simp-form (body form)))
+  ;; Rewrite (let (... (foo ([progn,let] x y)) ...) ...) to (let (...) ([progn,let] x (let ((foo y) ...) ...))) when possible.
+  (when (not (let-binds-special-variable-p form))
+    (loop
+       for binding-position from 0
+       for (variable initform) in (bindings form)
+       when (typep initform 'ast-progn)
+       do
+         (change-made)
+         (return-from simp-form
+           (simp-form
+            (ast `(let ,(subseq (bindings form) 0 binding-position)
+                    (progn
+                      ,@(butlast (ast-forms initform))
+                      (let ((,variable ,(first (last (ast-forms initform))))
+                            ,@(subseq (bindings form) (1+ binding-position)))
+                        ,(ast-body form))))
+                 form)))
+       when (and (typep initform 'ast-let)
+                 (not (let-binds-special-variable-p initform)))
+       do
+         (change-made)
+         (return-from simp-form
+           (simp-form
+            (ast `(let (,@(subseq (bindings form) 0 binding-position)
+                        ,@(bindings initform)
+                        (,variable ,(ast-body initform))
+                        ,@(subseq (bindings form) (1+ binding-position)))
+                    ,(ast-body form))
+                 form)))))
   ;; Remove the LET if there are no values.
   (cond ((bindings form)
-         (setf (body form) (simp-form (body form)))
          form)
         (t
          (change-made)
-         (simp-form (body form)))))
+         (body form))))
+
+(defun let-binds-special-variable-p (let-form)
+  (some (lambda (x) (typep (first x) 'special-variable))
+        (bindings let-form)))
 
 (defmethod simp-form ((form ast-multiple-value-bind))
   ;; If no variables are used, or there are no variables then
@@ -168,7 +226,8 @@
                 (bindings form))
          (change-made)
          (simp-form (ast `(progn ,(value-form form)
-                                 ,(body form)))))
+                                 ,(body form))
+                         form)))
         ;; M-V-B forms with only one variable can be lowered to LET.
         ((and (bindings form)
               (every (lambda (var)
@@ -177,14 +236,18 @@
                      (rest (bindings form))))
          (change-made)
          (simp-form (ast `(let ((,(first (bindings form)) ,(value-form form)))
-                            ,(body form)))))
+                            ,(body form))
+                         form)))
         ;; Use an inner LET form to bind any special variables.
         ((some (lambda (x) (typep x 'special-variable)) (bindings form))
          (change-made)
-         (let* ((specials (remove-if-not (lambda (x) (typep x 'special-variable)) (bindings form)))
-                (replacements (loop for s in specials
+         (let* ((specials (remove-if-not (lambda (x) (typep x 'special-variable))
+                                         (bindings form)))
+                (replacements (loop
+                                 for s in specials
                                  collect (make-instance 'lexical-variable
-                                                        :name s
+                                                        :inherit s
+                                                        :name (name s)
                                                         :definition-point *current-lambda*
                                                         :use-count 1)))
                 ;; Also doubles up as an alist mapping specials to replacements.
@@ -194,12 +257,42 @@
                                   (if (typep var 'special-variable)
                                       (second (assoc var bindings))
                                       var))
-                                (second form))
+                                (bindings form))
+                     ,(value-form form)
                      (let ,bindings
-                       ,(simp-form (body form)))))))
-        (t (setf (value-form form) (simp-form (value-form form))
-                 (body form) (simp-form (body form)))
-           form)))
+                       ,(simp-form (body form))))
+                form)))
+        ;; Rewrite (m-v-b (...) (let (...) ...) ...)
+        ;; to (let (...) (m-v-b (...) ... ...)) when there are no
+        ;; special bindings in the LET.
+        ;; This puts the real values form closer to the M-V-B.
+        ((and (typep (ast-value-form form) 'ast-let)
+              (not (let-binds-special-variable-p (ast-value-form form))))
+         (change-made)
+         (ast `(let ,(ast-bindings (ast-value-form form))
+                 (multiple-value-bind ,(ast-bindings form)
+                     ,(simp-form (ast-body (ast-value-form form)))
+                   ,(simp-form (ast-body form))))
+              form))
+        ;; Rewrite (m-v-b (bn...) (values vn...) ...)
+        ;; to (let ((bn vn)...) ...)
+        ((and (typep (ast-value-form form) 'ast-call)
+              (eql (ast-name (value-form form)) 'values))
+         (change-made)
+         (let ((values (ast-arguments (ast-value-form form))))
+           (ast `(let ,(loop
+                          for b in (ast-bindings form)
+                          collect (list b (if values
+                                              (pop values)
+                                              `'nil)))
+                   (progn
+                     ,@values
+                     ,(ast-body form)))
+                form)))
+        (t
+         (setf (value-form form) (simp-form (value-form form))
+               (body form) (simp-form (body form)))
+         form)))
 
 (defmethod simp-form ((form ast-multiple-value-call))
   (setf (function-form form) (simp-form (function-form form))
@@ -214,13 +307,15 @@
          (change-made)
          (ast `(progn ,@(butlast (forms (value-form form)))
                       (multiple-value-prog1 ,(car (last (forms (value-form form))))
-                        ,(body form)))))
+                        ,(body form)))
+              form))
         ((typep (value-form form) 'ast-multiple-value-prog1)
          ;; If the first form is a M-V-PROG1, then splice it in.
          (change-made)
          (ast `(multiple-value-prog1 ,(value-form (value-form form))
                  (progn ,(body (value-form form))
-                        ,(body form)))))
+                        ,(body form)))
+              form))
         ((typep (body form) '(or ast-quote ast-function lexical-variable lambda-information))
          ;; If the body form is mostly constant, then kill this completely.
          (change-made)
@@ -267,14 +362,14 @@
     (cond ((endp new-forms)
            ;; Flush empty PROGNs.
            (change-made)
-           (ast `(quote nil)))
+           (ast `(quote nil) form))
           ((endp (rest new-forms))
            ;; Reduce single form PROGNs.
            (change-made)
            (first new-forms))
           (t
            (setf (forms form) new-forms)
-	   form))))
+           form))))
 
 (defmethod simp-form ((form ast-quote))
   form)
@@ -285,8 +380,34 @@
   form)
 
 (defmethod simp-form ((form ast-setq))
-  (setf (value form) (simp-form (value form)))
-  form)
+  (let ((unwrapped-val (unwrap-the (value form))))
+    (cond ((and (typep unwrapped-val 'ast-let)
+                (not (let-binds-special-variable-p unwrapped-val)))
+           ;; (setq foo (let ... x)) => (let ... (setq foo x))
+           (change-made)
+           (let ((the-type (unwrapped-the-type (value form))))
+             (simp-form
+              (ast `(the ,the-type
+                         (let ,(bindings unwrapped-val)
+                           (setq ,(setq-variable form)
+                                 (the ,the-type
+                                      ,(body unwrapped-val)))))
+                   unwrapped-val))))
+          ((typep unwrapped-val 'ast-progn)
+           ;; (setq foo (progn ... x)) => (progn ... (setq foo x))
+           (change-made)
+           (let ((the-type (unwrapped-the-type (value form))))
+             (simp-form
+              (ast `(the ,the-type
+                         (progn
+                           ,@(butlast (ast-forms unwrapped-val))
+                           (setq ,(setq-variable form)
+                                 (the ,the-type
+                                      ,(first (last (ast-forms unwrapped-val)))))))
+                   unwrapped-val))))
+          (t
+           (setf (value form) (simp-form (value form)))
+           form))))
 
 (defmethod simp-form ((form ast-tagbody))
   ;; Remove unused go-tags.
@@ -311,13 +432,15 @@
                           (ast-tagbody
                            ;; Reached a tagbody.
                            ;; Jump from the current tag to the tagbody's entry tag.
-                           (push (ast `(go ,(first (first (statements subform))) ,(info form)))
+                           (push (ast `(go ,(first (first (statements subform))) ,(info form))
+                                      subform)
                                  accum)
                            (incf (go-tag-use-count (first (first (statements subform)))))
                            ;; Finish accumulating the forms before this tagbody.
-                           (push (list current-go-tag (ast `(progn ,@(reverse accum)))) new-stmts)
+                           (push (list current-go-tag (ast `(progn ,@(reverse accum)) subform)) new-stmts)
                            ;; Create a new go-tag that is *after* this tagbody.
                            (setf current-go-tag (make-instance 'go-tag
+                                                               :inherit subform
                                                                :name (gensym "tagbody-resume")
                                                                :use-count 1
                                                                :tagbody (info form))
@@ -333,16 +456,17 @@
                                 (incf (go-tag-use-count current-go-tag))
                                 (push (list new-go-tag (ast `(progn
                                                                ,new-statement
-                                                               (go ,current-go-tag ,(info form)))))
+                                                               (go ,current-go-tag ,(info form)))
+                                                            new-statement))
                                       new-stmts)))
                           (t ;; Normal form, accumulate it.
                            (push subform accum))))
                       ;; Finish the current tag.
-                      (push (list current-go-tag (ast `(progn ,@(reverse accum) 'nil))) new-stmts)))
+                      (push (list current-go-tag (ast `(progn ,@(reverse accum) 'nil) statement)) new-stmts)))
                    (t (push (list go-tag statement) new-stmts))))
             (ast-tagbody
              ;; Get this one.
-             (push (list go-tag (ast `(go ,(first (first (statements statement))) ,(info form)))) new-stmts)
+             (push (list go-tag (ast `(go ,(first (first (statements statement))) ,(info form)) statement)) new-stmts)
              (incf (go-tag-use-count (first (first (statements statement)))))
              (loop
                 for (new-go-tag new-statement) in (statements statement)
@@ -363,15 +487,71 @@
          (change-made)
          (ast `(progn
                  ,(second (first (statements form)))
-                 'nil)))
+                 'nil)
+              form))
         (t form)))
 
+(defun values-type-p (type)
+  (and (consp type)
+       (eql (first type) 'values)))
+
+(defun merge-the-types (type-1 type-2)
+  (cond ((equal type-1 type-2)
+         type-1)
+        ((or (values-type-p type-1)
+             (values-type-p type-2))
+         (when (not (values-type-p type-1))
+           (setf type-1 `(values ,type-1)))
+         (when (not (values-type-p type-2))
+           (setf type-2 `(values ,type-2)))
+         (do ((i (rest type-1) (rest i))
+              (j (rest type-2) (rest j))
+              (result '()))
+             ((and (endp i)
+                   (endp j))
+              `(values ,@(reverse result)))
+           (push (merge-the-types (if i (first i) 't)
+                                  (if j (first j) 't))
+                 result)))
+        (t
+         `(and ,type-1 ,type-2))))
+
 (defmethod simp-form ((form ast-the))
-  (cond ((eql (the-type form) 't)
+  (cond ((compiler-valid-subtypep 't (the-type form))
          (change-made)
          (simp-form (value form)))
-        (t (setf (value form) (simp-form (value form)))
-           form)))
+        ((typep (value form) 'ast-the)
+         (change-made)
+         (setf (the-type form) (merge-the-types (the-type form)
+                                                (the-type (value form)))
+               (value form) (simp-form (value (value form))))
+         form)
+        ((and (typep (value form) 'ast-let)
+              (not (typep (ast-body (value form)) 'ast-the)))
+         ;; Turn (the ... (let (...) ...)) inside-out: (let (...) (the ... ...))
+         (change-made)
+         (setf (ast-body (value form)) (ast `(the ,(the-type form)
+                                                  ,(ast-body (value form)))
+                                            form))
+         (setf (value form) (simp-form (value form)))
+         form)
+        ((typep (value form) 'ast-if)
+         ;; Push type declarations into IF arms.
+         (when (not (typep (if-then (value form)) 'ast-the))
+           (change-made)
+           (setf (if-then (value form)) (ast `(the ,(the-type form)
+                                                   ,(if-then (value form)))
+                                             (if-then (value form)))))
+         (when (not (typep (if-else (value form)) 'ast-the))
+           (change-made)
+           (setf (if-else (value form)) (ast `(the ,(the-type form)
+                                                   ,(if-else (value form)))
+                                             (if-else (value form)))))
+         (setf (value form) (simp-form (value form)))
+         form)
+        (t
+         (setf (value form) (simp-form (value form)))
+         form)))
 
 (defmethod simp-form ((form ast-unwind-protect))
   (setf (protected-form form) (simp-form (protected-form form))
@@ -398,30 +578,707 @@
       (setf (name form) 'eq)))
   form)
 
+(defun simp-ash (form)
+  (simp-form-list (arguments form))
+  (cond ((and (eql (list-length (arguments form)) 2)
+              (or (and (typep (second (arguments form)) 'ast-the)
+                       (match-optimize-settings form '((= safety 0) (= speed 3)))
+                       (compiler-valid-type-equal-p (ast-the-type (second (arguments form))) '(eql 0)))
+                  (and (quoted-form-p (second (arguments form)))
+                       (eql (value (second (arguments form))) 0))))
+         ;; (ash value 0) => (progn (type-check value integer) value)
+         (change-made)
+         (return-from simp-ash
+           (if (match-optimize-settings form '((= safety 0) (= speed 3)))
+               (ast `(let ((value ,(first (arguments form))))
+                       (progn
+                         ,(second (arguments form))
+                         value))
+                    form)
+               (ast `(let ((value ,(first (arguments form))))
+                       (progn
+                         ,(second (arguments form))
+                         (if (call integerp value)
+                             value
+                             (call sys.int::raise-type-error value 'integer))))
+                    form))))
+        ((and (eql (list-length (arguments form)) 2)
+              (quoted-form-p (second (arguments form)))
+              (integerp (value (second (arguments form)))))
+         ;; (ash value known-count) => left-shift or right-shift.
+         (change-made)
+         (cond ((plusp (value (second (arguments form))))
+                (setf (name form) 'mezzano.runtime::left-shift))
+               (t
+                (setf (name form) 'mezzano.runtime::right-shift
+                      (arguments form) (list (first (arguments form))
+                                             (make-instance 'ast-quote
+                                                            :inherit form
+                                                            :value (- (value (second (arguments form))))))))))
+        ((and (eql (list-length (arguments form)) 2)
+              (match-optimize-settings form '((= safety 0) (= speed 3)))
+              (typep (second (arguments form)) 'ast-the)
+              (compiler-valid-subtypep (ast-the-type (second (arguments form))) '(integer 0)))
+         ;; (ash value known-non-negative-integer) => left-shift
+         (change-made)
+         (setf (name form) 'mezzano.runtime::left-shift))
+        ((and (eql (list-length (arguments form)) 2)
+              (match-optimize-settings form '((= safety 0) (= speed 3)))
+              (typep (second (arguments form)) 'ast-the)
+              (compiler-valid-subtypep (ast-the-type (second (arguments form))) '(integer * 0)))
+         ;; (ash value known-non-positive-integer) => right-shift
+         (change-made)
+         (setf (name form) 'mezzano.runtime::right-shift
+               (arguments form) (list (first (arguments form))
+                                      (ast `(call sys.int::binary-- '0 ,(second (arguments form)))
+                                           form)))))
+  form)
+
+(defparameter *mod-n-arithmetic-functions*
+  '(sys.int::binary-+ sys.int::binary--
+    sys.int::binary-* sys.int::%truncate rem
+    sys.int::binary-logior sys.int::binary-logxor sys.int::binary-logand
+    mezzano.runtime::%fixnum-left-shift))
+
+(defun mod-n-transform-candidate-p (value mask)
+  ;; Mask must be a known positive power-of-two minus 1 fixnum.
+  (when (not (and (typep mask 'ast-quote)
+                  (typep (ast-value mask) 'fixnum)
+                  (> (ast-value mask) 0)
+                  (zerop (logand (ast-value mask)
+                                 (1+ (ast-value mask))))))
+    (return-from mod-n-transform-candidate-p
+      nil))
+  (when (and (typep value 'ast-call)
+             (eql (name value) 'sys.int::%truncate)
+             (eql (length (arguments value)) 2)
+             (match-transform-argument 'float (first (arguments value)))
+             (match-transform-argument '(eql 1) (second (arguments value))))
+    ;; Conversion from single-float to integer.
+    (return-from mod-n-transform-candidate-p
+      t))
+  (when (or (and (typep value 'ast-call)
+                 (member (name value) '(mezzano.simd:mmx-vector-value mezzano.simd::%mmx-vector-value))
+                 (eql (length (arguments value)) 1)
+                 (match-transform-argument 'mezzano.simd:mmx-vector (first (arguments value))))
+            (and (typep value 'ast-call)
+                 (member (name value) '(mezzano.simd:sse-vector-value mezzano.simd::%sse-vector-value))
+                 (eql (length (arguments value)) 1)
+                 (match-transform-argument 'mezzano.simd:sse-vector (first (arguments value)))))
+    ;; Conversion from mmx/sse--vector to integer.
+    (return-from mod-n-transform-candidate-p
+      t))
+  ;; The value must be a call to one of the arithmetic functions.
+  ;; Both sides must be fixnums. This will cause the fixnum arithmetic
+  ;; transforms to fire, and the calls to be transformed to their
+  ;; fixnum-appropriate functions.
+  (when (not (and (typep value 'ast-call)
+                  (member (name value) *mod-n-arithmetic-functions*)
+                  (eql (length (arguments value)) 2)
+                  (match-transform-argument 'fixnum (first (arguments value)))
+                  (match-transform-argument 'fixnum (second (arguments value)))))
+    (return-from mod-n-transform-candidate-p
+      nil))
+  t)
+
+;;; Fast(ish) mod-n arithmetic.
+;;; (logand (1- some-known-fixnum-power-of-two) (+ (the fixnum foo) (the fixnum bar)))
+;;;   =>
+;;; (logand (1- some-known-fixnum-power-of-two) (the fixnum (+ (the fixnum foo) (the fixnum bar))))
+;;; Any fixnum LOGAND a fixnum will produce a fixnum result.
+;;; This relies on the arithmetic function being transformed to a function
+;;; that really does only produce a fixnum result.
+(defun simp-logand (form)
+  (let ((lhs (first (arguments form)))
+        (rhs (second (arguments form))))
+    (cond ((mod-n-transform-candidate-p rhs lhs)
+           ;; Insert appropriate THE form.
+           (change-made)
+           (setf (second (arguments form)) (ast `(the fixnum ,rhs)
+                                                rhs)))
+          ((mod-n-transform-candidate-p lhs rhs)
+           ;; Insert appropriate THE form.
+           (change-made)
+           (setf (first (arguments form)) (ast `(the fixnum ,lhs)
+                                               lhs))))
+    form))
+
+(defun simp-array-rank (form)
+  (let* ((array (first (arguments form)))
+         (type (if (typep array 'ast-the)
+                   (ast-the-type array)
+                   't)))
+    (cond ((and (consp type)
+                ;; Arrays never change rank.
+                (member (first type) '(array simple-array)))
+           (let ((dims (nth-value 1 (sys.int::parse-array-type type))))
+             ;; Some kind of array. See if the rank is known.
+             (cond ((listp dims)
+                    ;; It is! Replace with the known length.
+                    (ast `(progn ,array
+                                 ',(length dims))
+                         form))
+                   (t form))))
+          (t
+           form))))
+
+(defun simp-array-dimension (form)
+  (let* ((array (first (arguments form)))
+         (axis (second (arguments form)))
+         (type (if (typep array 'ast-the)
+                   (ast-the-type array)
+                   't)))
+    (cond ((and (typep axis 'ast-quote)
+                (integerp (ast-value axis))
+                (consp type)
+                (member (first type) '(simple-array array)))
+           (multiple-value-bind (element-type dims)
+               (sys.int::parse-array-type type)
+             (let* ((rank (if (listp dims)
+                              (length dims)
+                              -1))
+                    (axis (ast-value axis))
+                    (dim (if (<= 0 axis (1- rank))
+                             (elt dims axis)
+                             nil)))
+               (cond ((integerp dim)
+                      ;; This axis has a known dimension.
+                      (ast `(progn ,array
+                                   ',dim)
+                           form))
+                     ((and (eql dim '*)
+                           (not (eql element-type '*)))
+                      ;; This axis is unknown, but the axis is valid.
+                      (if (and (eql rank 1)
+                               ;; Strings are always complex arrays.
+                               (compiler-valid-not-subtypep element-type 'character))
+                          (ast `(the fixnum (call sys.int::%object-header-data ,array))
+                               form)
+                          (ast `(the fixnum (call sys.int::%object-ref-t
+                                                  ,array
+                                                  ',(+ sys.int::+complex-array-axis-0+ axis)))
+                               form)))
+                   (t form)))))
+          (t
+           form))))
+
+(defun extract-list-like-forms (form)
+  "If FORM is a list-like series of calls, then return the objects that would form the elements of the list.
+First return value is a list of elements, second is the final dotted component (if any), third is true if a dynamic extent list is involved at any point."
+  (setf form (unwrap-the form))
+  (typecase form
+    (ast-call
+     (case (name form)
+       ((list dx-list)
+        (values (arguments form) nil (eql (name form) 'dx-list)))
+       ((list* dx-list*)
+        (multiple-value-bind (tail-components tail-tail dx-p)
+            (extract-list-like-forms (first (last (arguments form))))
+          (values (append (butlast (arguments form))
+                          tail-components)
+                  tail-tail
+                  (or dx-p (eql (name form) 'dx-list*)))))
+       ((cons)
+        (multiple-value-bind (tail-components tail-tail dx-p)
+            (extract-list-like-forms (second (arguments form)))
+          (values (append (list (first (arguments form)))
+                          tail-components)
+                  tail-tail
+                  dx-p)))
+       ((copy-list)
+        (extract-list-like-forms (first (arguments form))))
+       (t
+        (values nil form))))
+    (ast-quote
+     (let ((val (ast-value form))
+           (fast (ast-value form))
+           (elts '()))
+       (loop
+          (cond ((null val)
+                 (return (values (reverse elts) nil)))
+                ((not (consp val))
+                 (return (values (reverse elts)
+                                 (ast `(quote ,val) form))))
+                ((and elts (eql fast val))
+                 ;; Slow pointer met fast pointer, this is a circular list.
+                 ;; Give up.
+                 (return (values nil form)))
+                (t
+                 ;; Cons, accumulate elements.
+                 (push (ast `(quote ,(first val)) form) elts)
+                 (setf val (rest val))
+                 ;; Check for circular lists.
+                 (when (consp fast)
+                   (setf fast (rest fast))
+                   (when (consp fast)
+                     (setf fast (rest fast)))))))))
+    (t
+     (values nil form))))
+
+(defun simp-%apply (form)
+  (multiple-value-bind (list-body list-tail)
+      (extract-list-like-forms (second (arguments form)))
+    (cond ((not list-tail)
+           ;; (%apply foo (list ...)) => (%funcall foo ...)
+           (change-made)
+           (setf (name form) 'mezzano.runtime::%funcall
+                 (arguments form) (append (list (first (arguments form)))
+                                          list-body))
+           (simp-form form))
+          (t form))))
+
+(defun local-inlining-permitted-p (form)
+  ;; This call can be inlined it has not been locally declared notline.
+  (not (eql (second (assoc (ast-name form) (ast-inline-declarations form) :test #'equal)) 'notinline)))
+
+(defun struct-slot-accessor-name (slot-def fn-namespace)
+  (let ((accessor (mezzano.runtime::location-type-accessor
+                   (mezzano.runtime::location-type
+                    (mezzano.clos:slot-definition-location slot-def)))))
+    (if fn-namespace
+        (list fn-namespace accessor)
+        accessor)))
+
+(defun struct-slot-accessor-index (slot-def)
+  (let ((loc (mezzano.clos:slot-definition-location slot-def)))
+    (if (eql (mezzano.runtime::location-type loc) mezzano.runtime::+location-type-t+)
+        (mezzano.runtime::location-offset-t loc)
+        (mezzano.runtime::location-offset loc))))
+
+(defun struct-slot-access-form (slot-def object fn-namespace &rest additional-args)
+  `(the ,(mezzano.clos:slot-definition-type slot-def)
+        (call ,(struct-slot-accessor-name slot-def fn-namespace)
+              ,@additional-args
+              ,object
+              ',(struct-slot-accessor-index slot-def))))
+
+(defun find-struct-slot (struct-name slot-name)
+  (when (and (typep struct-name 'ast-quote)
+             (typep (ast-value struct-name) 'symbol))
+    (let ((struct-class (sys.int::get-structure-type (ast-value struct-name) nil)))
+      (and struct-class
+           (typep slot-name 'ast-quote)
+           (find (ast-value slot-name)
+                 (mezzano.clos:class-slots struct-class)
+                 :key #'mezzano.clos:slot-definition-name)))))
+
+(defun struct-type-test-form (object struct)
+  (if (mezzano.clos:class-sealed struct)
+      `(if (call sys.int::%value-has-tag-p ,object ',sys.int::+tag-object+)
+           (call sys.int::%fast-instance-layout-eq-p
+                 ,object
+                 ',(mezzano.runtime::%make-instance-header
+                    (mezzano.clos:class-layout struct)))
+           'nil)
+      `(if ,(struct-slot-access-form (find 'sys.int::obsolete
+                                           (mezzano.clos:class-slots
+                                            (sys.int::get-structure-type 'sys.int::layout))
+                                           :key #'mezzano.clos:slot-definition-name)
+                                     `',(mezzano.clos:class-layout struct)
+                                     nil)
+           'nil
+           (if (call sys.int::%value-has-tag-p ,object ',sys.int::+tag-object+)
+               (if (call sys.int::%fast-instance-layout-eq-p
+                         ,object
+                         ',(mezzano.runtime::%make-instance-header
+                            (mezzano.clos:class-layout struct)))
+                   't
+                   (call sys.int::structure-type-p ,object ',struct))
+               'nil))))
+
+(defun simplify-struct-slot (form)
+  (change-made)
+  (destructuring-bind (object structure-name slot-name)
+      (arguments form)
+    (let ((slot-def (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
+             (ast (struct-slot-access-form slot-def object nil)
+                  form))
+            (t
+             (ast `(let ((obj ,object))
+                     (if ,(struct-type-test-form 'obj struct)
+                         ,(struct-slot-access-form slot-def 'obj nil)
+                         (notinline-call sys.int::%struct-slot
+                                         obj
+                                         ',(ast-value structure-name)
+                                         ',(ast-value slot-name))))
+                  form))))))
+
+(defun simplify-setf-struct-slot (form)
+  (change-made)
+  (destructuring-bind (value object structure-name slot-name)
+      (arguments form)
+    (let ((slot-def (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
+             (ast (struct-slot-access-form slot-def object 'setf value)
+                  form))
+            (t
+             (ast `(let ((val ,value)
+                         (obj ,object))
+                     (if ,(struct-type-test-form 'obj struct)
+                         (progn
+                           (if (source-fragment (typep val ',(mezzano.clos:slot-definition-type slot-def)))
+                               'nil
+                               (progn
+                                 (call sys.int::raise-type-error val ',(mezzano.clos:slot-definition-type slot-def))
+                                 (call sys.int::%%unreachable)))
+                           ,(struct-slot-access-form slot-def 'obj 'setf 'val))
+                         (notinline-call (setf sys.int::%struct-slot)
+                                         val
+                                         obj
+                                         ',(ast-value structure-name)
+                                         ',(ast-value slot-name))))
+                  form))))))
+
+(defun simplify-cas-struct-slot (form)
+  (change-made)
+  (destructuring-bind (old new object structure-name slot-name)
+      (arguments form)
+    (let ((slot-def (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
+             (ast `(let ((old ,old)
+                         (new ,new)
+                         (obj ,object))
+                     ,(struct-slot-access-form slot-def 'obj 'sys.int::cas 'old 'new))
+                  form))
+            (t
+             (ast `(let ((old ,old)
+                         (new ,new)
+                         (obj ,object))
+                     (if ,(struct-type-test-form 'obj struct)
+                         (progn
+                           (if (source-fragment (typep old ',(mezzano.clos:slot-definition-type slot-def)))
+                               'nil
+                               (progn
+                                 (call sys.int::raise-type-error new ',(mezzano.clos:slot-definition-type slot-def))
+                                 (call sys.int::%%unreachable)))
+                           (if (source-fragment (typep new ',(mezzano.clos:slot-definition-type slot-def)))
+                               'nil
+                               (progn
+                                 (call sys.int::raise-type-error new ',(mezzano.clos:slot-definition-type slot-def))
+                                 (call sys.int::%%unreachable)))
+                           ,(struct-slot-access-form slot-def 'obj 'sys.int::cas 'old 'new))
+                         (notinline-call (sys.int::cas sys.int::%struct-slot)
+                                         old
+                                         new
+                                         obj
+                                         ',(ast-value structure-name)
+                                         ',(ast-value slot-name))))
+                form))))))
+
+(defun simplify-struct-vector-slot-check-bounds (index slot-def)
+  `(tagbody foo
+      (ENTRY (if (call sys.int::fixnump ,index)
+                 (if (call sys.int::binary-<= '0 ,index)
+                     (if (call sys.int::binary-< ,index ',(mezzano.clos:structure-slot-definition-fixed-vector slot-def))
+                         (go OK foo)
+                         (go BAD foo))
+                     (go BAD foo))
+                 (go BAD foo)))
+      (BAD (call error '"Struct fixed-vector out of bounds"))
+      (OK 'nil)))
+
+(defun struct-vector-slot-index-fast (slot-def index)
+  `(call sys.int::binary-+
+         (the fixnum ',(struct-slot-accessor-index slot-def))
+         (the fixnum
+              (call sys.int::binary-*
+                    (the fixnum ,index)
+                    ',(mezzano.runtime::location-type-scale
+                       (mezzano.runtime::location-type
+                        (mezzano.clos:slot-definition-location slot-def)))))))
+
+(defun struct-vector-slot-index (slot-def index)
+  `(call sys.int::binary-+
+         ',(struct-slot-accessor-index slot-def)
+         (call sys.int::binary-*
+               ,index
+               ',(mezzano.runtime::location-type-scale
+                  (mezzano.runtime::location-type
+                   (mezzano.clos:slot-definition-location slot-def))))))
+
+(defun struct-vector-slot-access-form (slot-def object fn-namespace index fastp &rest additional-args)
+  `(the ,(mezzano.clos:slot-definition-type slot-def)
+        (call ,(struct-slot-accessor-name slot-def fn-namespace)
+              ,@additional-args
+              ,object
+              ,(if fastp
+                   (struct-vector-slot-index-fast slot-def index)
+                   (struct-vector-slot-index slot-def index)))))
+
+(defun simplify-struct-vector-slot (form)
+  (change-made)
+  (destructuring-bind (object structure-name slot-name index)
+      (arguments form)
+    (let ((slot-def (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
+             (ast (struct-vector-slot-access-form slot-def object nil index t)
+                  form))
+            (t
+             (ast `(let ((obj ,object)
+                         (ind ,index))
+                     (progn
+                       ,(simplify-struct-vector-slot-check-bounds 'ind slot-def)
+                       (if ,(struct-type-test-form 'obj struct)
+                           ,(struct-vector-slot-access-form slot-def 'obj nil 'ind nil)
+                           (notinline-call sys.int::%struct-vector-slot
+                                           obj
+                                           ',(ast-value structure-name)
+                                           ',(ast-value slot-name)
+                                           ind))))
+                  form))))))
+
+(defun simplify-setf-struct-vector-slot (form)
+  (change-made)
+  (destructuring-bind (value object structure-name slot-name index)
+      (arguments form)
+    (let ((slot-def (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
+             (ast (struct-vector-slot-access-form slot-def object 'setf index t value)
+                  form))
+            (t
+             (ast `(let ((val ,value)
+                         (obj ,object)
+                         (ind ,index))
+                     (progn
+                       ,(simplify-struct-vector-slot-check-bounds 'ind slot-def)
+                       (if ,(struct-type-test-form 'obj struct)
+                           (progn
+                             (if (source-fragment (typep val ',(mezzano.clos:slot-definition-type slot-def)))
+                                 'nil
+                                 (progn
+                                   (call sys.int::raise-type-error val ',(mezzano.clos:slot-definition-type slot-def))
+                                   (call sys.int::%%unreachable)))
+                             ,(struct-vector-slot-access-form slot-def 'obj 'setf 'ind nil 'val))
+                           (notinline-call (setf sys.int::%struct-vector-slot)
+                                           val
+                                           obj
+                                           ',(ast-value structure-name)
+                                           ',(ast-value slot-name)
+                                           ind))))
+                form))))))
+
+(defun simplify-cas-struct-vector-slot (form)
+  (change-made)
+  (destructuring-bind (old new object structure-name slot-name index)
+      (arguments form)
+    (let ((slot-def (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
+             (ast `(let ((old ,old)
+                         (new ,new)
+                         (obj ,object)
+                         (ind ,index))
+                     ,(struct-vector-slot-access-form slot-def 'obj 'sys.int::cas 'ind t 'old 'new))
+                form))
+          (t
+           (ast `(let ((old ,old)
+                       (new ,new)
+                       (obj ,object)
+                       (ind ,index))
+                   (progn
+                     ,(simplify-struct-vector-slot-check-bounds 'ind slot-def)
+                     (if ,(struct-type-test-form 'obj struct)
+                         (progn
+                           (if (source-fragment (typep old ',(mezzano.clos:slot-definition-type slot-def)))
+                               'nil
+                               (progn
+                                 (call sys.int::raise-type-error new ',(mezzano.clos:slot-definition-type slot-def))
+                                 (call sys.int::%%unreachable)))
+                           (if (source-fragment (typep new ',(mezzano.clos:slot-definition-type slot-def)))
+                               'nil
+                               (progn
+                                 (call sys.int::raise-type-error new ',(mezzano.clos:slot-definition-type slot-def))
+                                 (call sys.int::%%unreachable)))
+                           ,(struct-vector-slot-access-form slot-def 'obj 'sys.int::cas 'ind nil 'old 'new))
+                         (notinline-call (sys.int::cas sys.int::%struct-vector-slot)
+                                         old
+                                         new
+                                         obj
+                                         ',(ast-value structure-name)
+                                         ',(ast-value slot-name)
+                                         ind))))
+                form))))))
+
 (defmethod simp-form ((form ast-call))
-  ;; (funcall 'symbol ...) -> (symbol ...)
-  ;; (funcall #'name ...) -> (name ...)
-  (cond ((and (eql (name form) 'funcall)
-              (or (typep (first (arguments form)) 'ast-function)
-                  (and (typep (first (arguments form)) 'ast-quote)
-                       (symbolp (value (first (arguments form)))))))
+  (simp-form-list (arguments form))
+  (cond ((eql (name form) 'eql)
+         (simp-eql form))
+        ((eql (name form) 'ash)
+         (simp-ash form))
+        ((and (eql (name form) 'array-rank)
+              (eql (length (arguments form)) 1)
+              (match-optimize-settings form '((= safety 0) (= speed 3))))
+         (simp-array-rank form))
+        ((and (eql (name form) 'array-dimension)
+              (eql (length (arguments form)) 2)
+              (match-optimize-settings form '((= safety 0) (= speed 3))))
+         (simp-array-dimension form))
+        ((and (member (name form) '(sys.int::binary-logand %fast-fixnum-logand))
+              (eql (length (arguments form)) 2)
+              (match-optimize-settings form '((= safety 0) (= speed 3))))
+         (simp-logand form))
+        ;; (%coerce-to-callable 'foo) => #'foo
+        ((and (eql (name form) 'sys.int::%coerce-to-callable)
+              (eql (length (arguments form)) 1)
+              (typep (unwrap-the (first (arguments form))) 'ast-quote)
+              (symbolp (value (unwrap-the (first (arguments form))))))
+         (change-made)
+         (ast `(function ,(value (unwrap-the (first (arguments form)))))
+              form))
+        ;; (%coerce-to-callable #'foo) => #'foo
+        ((and (eql (name form) 'sys.int::%coerce-to-callable)
+              (eql (length (arguments form)) 1)
+              (typep (unwrap-the (first (arguments form))) 'ast-function))
+         (change-made)
+         (first (arguments form)))
+        ;; (%coerce-to-callable (lambda ...)) => (lambda ...)
+        ((and (eql (name form) 'sys.int::%coerce-to-callable)
+              (eql (length (arguments form)) 1)
+              (typep (unwrap-the (first (arguments form))) 'lambda-information))
+         (change-made)
+         (first (arguments form)))
+        ;; (%coerce-to-callable '#<function>) => #<function>
+        ((and (eql (name form) 'sys.int::%coerce-to-callable)
+              (eql (length (arguments form)) 1)
+              (typep (unwrap-the (first (arguments form))) 'ast-quote)
+              (functionp (ast-value (unwrap-the (first (arguments form))))))
+         (change-made)
+         (first (arguments form)))
+        ;; (%apply #'foo (list ...)) => (foo ...)
+        ((and (eql (name form) 'mezzano.runtime::%apply)
+              (eql (length (arguments form)) 2))
+         (simp-%apply form))
+        ;; (%funcall #'name ...) -> (name ...)
+        ((and (eql (name form) 'mezzano.runtime::%funcall)
+              (typep (unwrap-the (first (arguments form))) 'ast-function))
          (change-made)
          (simp-form-list (rest (arguments form)))
-         (let ((name (etypecase (first (arguments form))
-                       (ast-quote
-                        (value (first (arguments form))))
-                       (ast-function
-                        (name (first (arguments form)))))))
-           (ast `(call ,name ,@(rest (arguments form))))))
-        ((eql (name form) 'eql)
-         (simp-eql form))
-        (t (simp-form-list (arguments form))
-           form)))
+         (ast `(call ,(name (unwrap-the (first (arguments form))))
+                     ,@(rest (arguments form))) form))
+        ;; (funcall fn ...) = (%funcall (%coerce-to-callable fn) ...)
+        ((and (eql (name form) 'funcall)
+              (consp (arguments form)))
+         (change-made)
+         (ast `(call mezzano.runtime::%funcall
+                     (call sys.int::%coerce-to-callable
+                           ,(first (arguments form)))
+                     ,@(rest (arguments form)))
+              form))
+        ;; (list ...) => (cons ... NIL)
+        ((eql (name form) 'list)
+         (change-made)
+         (let ((inner (ast `(quote nil) form)))
+           (loop
+              for arg in (reverse (arguments form))
+              do (setf inner (ast `(call cons ,arg ,inner) form)))
+           inner))
+        ;; (list* ... x) => (cons ... x)
+        ((and (eql (name form) 'list*)
+              (arguments form))
+         (change-made)
+         (let ((inner (first (last (arguments form)))))
+           (loop
+              for arg in (reverse (butlast (arguments form)))
+              do (setf inner (ast `(call cons ,arg ,inner) form)))
+           inner))
+        ;; (%struct-slot s 'def 'slot) => fast-reader
+        ((and (eql (name form) 'sys.int::%struct-slot)
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 3)
+              (find-struct-slot (second (arguments form)) (third (arguments form))))
+         (simplify-struct-slot form))
+        ;; ((setf %struct-slot) value s 'def 'slot) => fast-writer
+        ((and (equal (name form) '(setf sys.int::%struct-slot))
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 4)
+              (find-struct-slot (third (arguments form)) (fourth (arguments form))))
+         (simplify-setf-struct-slot form))
+        ;; ((cas %struct-slot) old new s 'def 'slot) => fast-cas
+        ((and (equal (name form) '(sys.int::cas sys.int::%struct-slot))
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 5)
+              (find-struct-slot (fourth (arguments form)) (fifth (arguments form))))
+         (simplify-cas-struct-slot form))
+        ;; (%struct-vector-slot s 'def 'slot index) => fast-reader
+        ((and (eql (name form) 'sys.int::%struct-vector-slot)
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 4)
+              (find-struct-slot (second (arguments form)) (third (arguments form))))
+         (simplify-struct-vector-slot form))
+        ;; ((setf %struct-vector-slot) value s 'def 'slot index) => fast-writer
+        ((and (equal (name form) '(setf sys.int::%struct-vector-slot))
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 5)
+              (find-struct-slot (third (arguments form)) (fourth (arguments form))))
+         (simplify-setf-struct-vector-slot form))
+        ;; ((cas %struct-vector-slot) old new s 'def 'slot index) => fast-cas
+        ((and (equal (name form) '(sys.int::cas sys.int::%struct-vector-slot))
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 6)
+              (find-struct-slot (fourth (arguments form)) (fifth (arguments form))))
+         (simplify-cas-struct-vector-slot form))
+        ;; (%allocate-struct 'name) => (%allocate-struct 'struct)
+        ((and (eql (name form) 'sys.int::%allocate-struct)
+              (local-inlining-permitted-p form)
+              (= (length (arguments form)) 1)
+              (typep (first (arguments form)) 'ast-quote)
+              (symbolp (ast-value (first (arguments form))))
+              (sys.int::get-structure-type (ast-value (first (arguments form))) nil))
+         (change-made)
+         (ast `(call sys.int::%allocate-struct ',(sys.int::get-structure-type (ast-value (first (arguments form)))))
+              form))
+        (t
+         ;; Rewrite (foo ... ([progn,let] x y) ...) to ([progn,let] x (foo ... y ...)) when possible.
+         (loop
+            for arg-position from 0
+            for arg in (arguments form)
+            for type = (unwrapped-the-type arg)
+            for unwrapped-arg = (unwrap-the arg)
+            when (typep unwrapped-arg 'ast-progn)
+            do
+              (change-made)
+              (return-from simp-form
+                (simp-form
+                 (ast `(progn
+                         ,@(butlast (ast-forms unwrapped-arg))
+                         (call ,(ast-name form)
+                               ,@(subseq (arguments form) 0 arg-position)
+                               (the ,type ,(first (last (ast-forms unwrapped-arg))))
+                               ,@(subseq (arguments form) (1+ arg-position))))
+                      form)))
+            when (and (typep unwrapped-arg 'ast-let)
+                      (not (let-binds-special-variable-p unwrapped-arg)))
+            do
+              (change-made)
+              (return-from simp-form
+                (simp-form
+                 (ast `(let ,(ast-bindings unwrapped-arg)
+                         (call ,(ast-name form)
+                               ,@(subseq (arguments form) 0 arg-position)
+                               (the ,type ,(ast-body unwrapped-arg))
+                               ,@(subseq (arguments form) (1+ arg-position))))
+                      form)))
+            ;; Bail when a non-pure arg is seen. Arguments after this one can't safely be hoisted.
+            when (not (pure-p unwrapped-arg))
+            do (return))
+         form)))
 
 (defmethod simp-form ((form ast-jump-table))
   (setf (value form) (simp-form (value form)))
   (setf (targets form) (mapcar #'simp-form (targets form)))
-  form)
+  (cond ((and (typep (value form) 'ast-quote)
+              (typep (value (value form)) 'integer)
+              (<= 0 (value (value form)) (1- (length (targets form)))))
+         (change-made)
+         (elt (targets form) (value (value form))))
+        (t
+         form)))
 
 (defmethod simp-form ((form lexical-variable))
   form)

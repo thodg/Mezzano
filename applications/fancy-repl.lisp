@@ -8,7 +8,7 @@
 (in-package :mezzano.gui.fancy-repl)
 
 (defclass fancy-repl (mezzano.line-editor:line-edit-mixin
-                      sys.gray:fundamental-character-input-stream
+                      mezzano.gray:fundamental-character-input-stream
                       mezzano.gui.widgets:text-widget)
   ((%fifo :initarg :fifo :reader fifo)
    (%window :initarg :window :reader window)
@@ -28,7 +28,7 @@
        (when (zerop start)
          (return))
        (let ((ch (char buffer (1- start))))
-         (when (eql (sys.int::readtable-syntax-type ch) :whitespace)
+         (when (eql (mezzano.internals::readtable-syntax-type ch) :whitespace)
            (return))
          (when (get-macro-character ch)
            (return)))
@@ -40,7 +40,7 @@
        (let ((ch (char buffer end)))
          (when (get-macro-character ch)
            (return))
-         (when (eql (sys.int::readtable-syntax-type ch) :whitespace)
+         (when (eql (mezzano.internals::readtable-syntax-type ch) :whitespace)
            (return)))
        (incf end))
     ;; Divide into package and symbol.
@@ -99,11 +99,12 @@
                                       ;; Force character to uppercase when a modifier key is active, gets
                                       ;; around weirdness in how character names are processed.
                                       ;; #\C-a and #\C-A both parse as the same character (C-LATIN_CAPITAL_LETTER_A).
-                                      (sys.int::make-character (char-code (char-upcase (mezzano.gui.compositor:key-key event)))
-                                                               :control (find :control (mezzano.gui.compositor:key-modifier-state event))
-                                                               :meta (find :meta (mezzano.gui.compositor:key-modifier-state event))
-                                                               :super (find :super (mezzano.gui.compositor:key-modifier-state event))
-                                                               :hyper (find :hyper (mezzano.gui.compositor:key-modifier-state event)))
+                                      (mezzano.internals::make-character
+                                       (char-code (char-upcase (mezzano.gui.compositor:key-key event)))
+                                       :control (find :control (mezzano.gui.compositor:key-modifier-state event))
+                                       :meta (find :meta (mezzano.gui.compositor:key-modifier-state event))
+                                       :super (find :super (mezzano.gui.compositor:key-modifier-state event))
+                                       :hyper (find :hyper (mezzano.gui.compositor:key-modifier-state event)))
                                       (mezzano.gui.compositor:key-key event))
                                   (input-buffer window) nil)))
 
@@ -111,8 +112,39 @@
   (mezzano.gui.widgets:frame-mouse-event (frame window) event))
 
 (defmethod dispatch-event (window (event mezzano.gui.compositor:window-close-event))
-  (throw 'mezzano.supervisor::terminate-thread nil)
-  (setf (window-closed window) t))
+  (throw 'mezzano.supervisor:terminate-thread nil))
+
+(defmethod dispatch-event (window (event mezzano.gui.compositor:quit-event))
+  (throw 'mezzano.supervisor:terminate-thread nil))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-request-event))
+  (let ((old-width (mezzano.gui.compositor:width (window app)))
+        (old-height (mezzano.gui.compositor:height (window app)))
+        (new-width (max 100 (mezzano.gui.compositor:width event)))
+        (new-height (max 100 (mezzano.gui.compositor:height event))))
+    (when (or (not (eql old-width new-width))
+              (not (eql old-height new-height)))
+      (let ((new-framebuffer (mezzano.gui:make-surface
+                              new-width new-height))
+            (frame (frame app)))
+        (mezzano.gui.widgets:resize-frame frame new-framebuffer)
+        (mezzano.gui.widgets:resize-text-widget
+         app
+         new-framebuffer
+         (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+         (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+         (- new-width
+            (nth-value 0 (mezzano.gui.widgets:frame-size frame))
+            (nth-value 1 (mezzano.gui.widgets:frame-size frame)))
+         (- new-height
+            (nth-value 2 (mezzano.gui.widgets:frame-size frame))
+            (nth-value 3 (mezzano.gui.widgets:frame-size frame))))
+        (mezzano.gui.compositor:resize-window
+         (window app) new-framebuffer
+         :origin (mezzano.gui.compositor:resize-origin event))))))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-event))
+  )
 
 (defun pump-event-loop (window)
   "Read & dispatch window events until there are no more waiting events."
@@ -122,13 +154,14 @@
          (return))
        (dispatch-event window evt))))
 
-(defmethod sys.gray:stream-read-char ((stream fancy-repl))
+(defmethod mezzano.gray:stream-read-char ((stream fancy-repl))
   (unwind-protect
        (progn
          (setf (mezzano.gui.widgets:cursor-visible stream) t)
          (loop
             ;; Catch up with window manager events.
             (pump-event-loop stream)
+            (setf (mezzano.gui.widgets:cursor-visible stream) t)
             (when (window-closed stream)
               (return :eof))
             ;; Check for an available character.
@@ -139,28 +172,31 @@
             (dispatch-event stream (mezzano.supervisor:fifo-pop (fifo stream)))))
     (setf (mezzano.gui.widgets:cursor-visible stream) nil)))
 
-(defmethod sys.gray:stream-read-char-no-hang ((stream fancy-repl))
+(defmethod mezzano.gray:stream-read-char-no-hang ((stream fancy-repl))
   ;; Catch up with window manager events.
   (pump-event-loop stream)
   (cond ((window-closed stream)
          :eof)
         (t (mezzano.supervisor:fifo-pop (input-buffer stream) nil))))
 
-(defmethod sys.gray:stream-terpri :before ((stream fancy-repl))
+(defmethod mezzano.gray:stream-terpri :before ((stream fancy-repl))
   ;; Catch up with window manager events.
   (pump-event-loop stream))
 
-(defmethod sys.gray:stream-write-char :before ((stream fancy-repl) character)
+(defmethod mezzano.gray:stream-write-char :before ((stream fancy-repl) character)
   ;; Catch up with window manager events.
   (pump-event-loop stream))
 
-(defmethod sys.gray:stream-clear-input ((stream fancy-repl))
+(defmethod mezzano.gray:stream-clear-input ((stream fancy-repl))
   ;; Catch up with window manager events.
   (pump-event-loop stream)
   ;; Munch all waiting characters.
   (loop
      (when (not (mezzano.supervisor:fifo-pop (input-buffer stream) nil))
        (return))))
+
+(defmethod interactive-stream-p ((stream fancy-repl))
+  't)
 
 (defun repl-main (&optional initial-function title width height)
   (let ((font (mezzano.gui.font:open-font
@@ -173,7 +209,9 @@
                                    :framebuffer framebuffer
                                    :title (string (or title initial-function "REPL"))
                                    :close-button-p t
-                                   :damage-function (mezzano.gui.widgets:default-damage-function window)))
+                                   :resizablep t
+                                   :damage-function (mezzano.gui.widgets:default-damage-function window)
+                                   :set-cursor-function (mezzano.gui.widgets:default-cursor-function window)))
              (term (make-instance 'fancy-repl
                                   :fifo fifo
                                   :window window
@@ -204,7 +242,7 @@
                                               (mezzano.gui.compositor:width window)
                                               (mezzano.gui.compositor:height window))
         (handler-case
-            (funcall (or initial-function #'sys.int::repl))
+            (funcall (or initial-function #'mezzano.internals::repl))
           ;; Exit when the close button is clicked.
           (mezzano.gui.widgets:close-button-clicked ()
             (return-from repl-main)))))))
